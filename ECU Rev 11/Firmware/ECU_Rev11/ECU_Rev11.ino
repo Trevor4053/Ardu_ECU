@@ -11,15 +11,14 @@
           This is done because we found that magnetic RPM sensing is not correct due to brushless motor EM noise.
           The issue is not present when a DC brushed motor is used
 //Rev10 - DynamicJsonDoc moved from global to local- Removed OLED Displays, Updated Page 4 for battery voltage and maxLoopTime 
-//Rev11 - Changed Pin assignments and added 4 wire SD card capability, SD Card functions running on Core 0 while Main loop is running on Core 1.
+//Rev11 - Changed Pin assignments and migrated to LittleFS for internal ESP32-S3 flash logging.
           Changed data range to 0-1000
-          At each power up two files are written to SD Card. 
+          At each power up two files are written to Internal Flash. 
           1) Settings file with all the settings at power up and
           2) Data file with engine operating data from power up till the ECU is powered off
           Added sd loop time and data file name info on Page 4.
           Added buttons on page 4 to reset error,manage files and change ECU modes. Added page 7 to be able to download and delete data files
-          Added Fuel Solenoid capability. Added Two LED's to Show WiFi State and SD Recording state.SD card pinout as below
-          http://3.bp.blogspot.com/_8JZhVVmpICU/TH_Pxa19MHI/AAAAAAAAApg/pgSppwx0gY8/s1600/SD+card+pinout.jpg
+          Added Fuel Solenoid capability. Added Two LED's to Show WiFi State and Recording state.
           Added ability to change ECU Webserver WiFi SSID and Password on page 1
           Added option for Magnetic (1 Pulse per revolution)  or Optical (2 pulses per revolution)  RPM sensor 
           implemented tempGradient check to limit sharp rise in exhaust temperature (tempGrad and maxTempGrad variables)
@@ -70,10 +69,7 @@ Note: All settings in this sequence are changeable through web interface
 #include <U8g2lib.h>
 #include <Preferences.h>//EEPROM library
 #include "RunningAverage.h"
-#include <FS.h>
-//#include <SPI.h>
-#include <SD_MMC.h>
-#include "driver/sdmmc_types.h"
+#include <LittleFS.h>
 #include <MAX31855.h>
 #include <ESP32Servo.h> 
 #include <EasyButton.h>
@@ -92,30 +88,23 @@ Note: All settings in this sequence are changeable through web interface
 #include "page8.h"//Data file download page
 
 
-//for storing data to SD card
+//for storing data to Internal Flash
 
-TaskHandle_t sdTask; //SD write Task to run on core 0 to avoid delay in main code
-//SD card File
+TaskHandle_t fsTask; //Flash write Task to run on core 0 to avoid delay in main code
+//Flash File
 File file;
 int fileseq=0;//Sequence in filename
 char filename[32]; //Filename for data storage
 char settingsfilename[32];//filename for settings data
 //downloading and deleting files
 String   webpage, MessageLine;
- bool dirpresent=false;//if default data directory is present or not
-bool sdavailable=false;
+bool dirpresent=false;//if default data directory is present or not
+bool fsavailable=false;
 bool writefile=true; //only write file if this variable is true
-String Data="";//Data string to be logged to SD card
+String Data="";//Data string to be logged to Flash
 String sysMsg="";//system Message
-// pins for PCB design with MicroSD
 
-//#define SD-D0                2 //SD pins are used but no need to define them
-//#define SD-D1                4 
 #define MAXCS                  5 //SPI Thermocouple CS 
-//#define SD-D2                12 //SD card 4 wire interface has fixed GPIO on ESP32 . No need to define these
-//#define SD-D3                13 //Also when using 4 wire interface, these pins cannot be used for any other purpose
-//#define SD-CLK               14 
-//#define SD_CMD               15 
 #define LEDPin_1               16 
 #define LEDPin_2               17 
 #define ThermoSCK            18
@@ -132,17 +121,15 @@ String sysMsg="";//system Message
 #define RC_Throttle_Pin      39 
 
 
-
 //counter for RPM
 #define PCNT_FREQ_UNIT      PCNT_UNIT_0                      // select ESP32 pulse counter unit 0 (out of 0 to 7 indipendent counting units)
-  pcnt_isr_handle_t user_isr_handle = NULL;                    // interrupt handler - not used
-  hw_timer_t * timer = NULL;                                   // Instancia do timer                                                              // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/pcnt.html
- 
-  int16_t PulseCounter =     0;                                // pulse counter, max. value is 65536
-  int OverflowCounter =      0;                                // pulse counter overflow counter
-  int PCNT_H_LIM_VAL =       10000;                            // upper limit of counting  max. 32767, write +1 to overflow counter, when reached 
-  uint16_t PCNT_FILTER_VAL=  1000;                             // filter (damping, inertia) value for avoiding glitches in the count, max. 1023
+pcnt_isr_handle_t user_isr_handle = NULL;                    // interrupt handler - not used
+hw_timer_t * timer = NULL;                                   // Instancia do timer                                                              // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/pcnt.html
 
+int16_t PulseCounter =     0;                                // pulse counter, max. value is 65536
+int OverflowCounter =      0;                                // pulse counter overflow counter
+int PCNT_H_LIM_VAL =       10000;                            // upper limit of counting  max. 32767, write +1 to overflow counter, when reached 
+uint16_t PCNT_FILTER_VAL=  1000;                             // filter (damping, inertia) value for avoiding glitches in the count, max. 1023
 
 
 //defining push button function
@@ -162,69 +149,69 @@ bool eventServer=false;
 String ssid     = "Ardu_ECU";
 String password = "admin123";//Pass phrase has to be 8 or more characters for ssid to work
 char* PARAM_ServerState = "state";
- char* PARAM_maxTemp = "maxTemp";                           //Maximum exhaust temperature in degC. Engine will cut throttle if this temperature is exceeded. It will not shut down
- char* PARAM_maxRPM = "maxRPM";                             //Maximum RPM. Engine will cut throttle if this is exceeded, it will not shut down the engine
+char* PARAM_maxTemp = "maxTemp";                           //Maximum exhaust temperature in degC. Engine will cut throttle if this temperature is exceeded. It will not shut down
+char* PARAM_maxRPM = "maxRPM";                             //Maximum RPM. Engine will cut throttle if this is exceeded, it will not shut down the engine
 char* PARAM_cpr = "cpr";                                     //Counts per revolution based on sensor type
- char* PARAM_idleRPM = "idleRPM";                           //RPM while running at zero throttle. ECU will try to maintain this RPM at zero throttle
- char* PARAM_rpmTolerance = "rpmTolerance";                      //RPM tolerance range, target RPMs will be RPM+ within rpmTolerance range
- char* PARAM_glowOnRPM = "glowOnRPM";                       //RPM at which glow plug will be switched on at startup
- char* PARAM_glowOffRPM = "glowOffRPM";                     //RPM exceeding which the glow plug will be turned off
- char* PARAM_ignitionRPMHigh = "ignitionRPMHigh";           //At start up ECU will run engine between ignitionRPMHIGH and ignitionRPMLOW with gas and glow plug energized to create ignition
- char* PARAM_ignitionRPMLow = "ignitionRPMLow";             //At start up ECU will run engine between ignitionRPMHIGH and ignitionRPMLOW with gas and glow plug energized to create ignition
- char* PARAM_gasOnRPM= "gasOnRPM";                          //RPM at which gas valve will be turned On
- char* PARAM_gasOffRPM = "gasOffRPM";                       //RPM at which gas valve will be turned off
- char* PARAM_starterOffRPM = "starterOffRPM";               //RPM at which starter motor will be turned off
- char* PARAM_fuelOnRPM = "fuelOnRPM";                       //RPM at which fuel pump will be switched on
- char* PARAM_pumpOnValue = "pumpOnValue";                  //Initial value of fuel pump as fuel pumps donot start pumping until a certain input value
- char* PARAM_purgeTime = "purgeTime";                       //Time for which engine will run at purge throttle without fuel or gas to clear the engine at begining
- char* PARAM_purgeThrottle = "purgeThrottle";               //Throttle for purge operation in begining
- char* PARAM_starterIncDelay = "starterIncDelay";           //Delay built into starter control to limit the rate of change of starter RPM
- char* PARAM_starterLimit="starterLimit";                 //Used for brushless starter to stop at Throttle=starterLimit
- char* PARAM_accelerationDelay = "accelerationDelay";       //Delay built in to limit fuel flow increase to avoid dumping too much fuel into engine
- char* PARAM_decelerationDelay = "decelerationDelay";       //Delay built in to limit fuel flow decrease to avoid flameout by starving the engine
- char* PARAM_lowDecelDelay = "lowDecelDelay";       //Delay built in to limit fuel flow decrease to avoid flameout by starving the engine
- char* PARAM_lowAccelDelay = "lowAccelDelay";       //Delay built in to limit fuel flow decrease to avoid flameout by starving the engine
- char* PARAM_ignitionThreshold = "ignitionThreshold";       //Temperture above which ignition will be detected
- char* PARAM_noIgnitionThreshold="noIgnitionThreshold";     //Time in milliseconds after which startup sequence will be aborted due to no ignition
- char* PARAM_fuelFlowDetectionTime="fuelFlowDetectionTime"; //Time in which engine should reach a certain RPM after starting fuel pump (Startup only)
- char* PARAM_fuelFlowDetectionRPM="fuelFlowDetectionRPM";   //RPM to reach to confirm that engine is running on fuel and not on gas only
- char* PARAM_trialModeFuelOnRPM="trialModeFuelOnRPM";   //RPM to reach to when fuel will be switched on for lubricating the bearings
- char* PARAM_trialModeFuelFlow="trialModeFuelFlow";     //Fuel Flow to pump in Starter Only test mode to lubricate bearings
- char* PARAM_startingTemp="startingTemp";                  //maximum temperature for starting phase
- char* PARAM_maxTempGrad="maxTempGrad";                  //maximum temperature for starting phase
- char* PARAM_maxMotorVolt="maxMotorVolt";                  //maximum motor voltage. this allows motors with less voltage limit to be used with bigger battery packs
- char* PARAM_maxPumpVolt="maxPumpVolt";                  //maximum fuel pump voltage. this allows fuel pumps with less voltage limit to be used with bigger battery packs
-  char* PARAM_MIN_MICROS = "MIN_MICROS";              //minimum microseconds for servo control
- char* PARAM_MAX_MICROS = "MAX_MICROS";                //maximum microseconds for servo control
- char* PARAM_voltIn = "voltIn";                //Input voltage
- char* PARAM_WiFiSSID = "WiFiSSID";                //Wifi Name/SSID
- char* PARAM_WiFiPWD = "WiFiPWD";                //WiFi Password
+char* PARAM_idleRPM = "idleRPM";                           //RPM while running at zero throttle. ECU will try to maintain this RPM at zero throttle
+char* PARAM_rpmTolerance = "rpmTolerance";                      //RPM tolerance range, target RPMs will be RPM+ within rpmTolerance range
+char* PARAM_glowOnRPM = "glowOnRPM";                       //RPM at which glow plug will be switched on at startup
+char* PARAM_glowOffRPM = "glowOffRPM";                     //RPM exceeding which the glow plug will be turned off
+char* PARAM_ignitionRPMHigh = "ignitionRPMHigh";           //At start up ECU will run engine between ignitionRPMHIGH and ignitionRPMLOW with gas and glow plug energized to create ignition
+char* PARAM_ignitionRPMLow = "ignitionRPMLow";             //At start up ECU will run engine between ignitionRPMHIGH and ignitionRPMLOW with gas and glow plug energized to create ignition
+char* PARAM_gasOnRPM= "gasOnRPM";                          //RPM at which gas valve will be turned On
+char* PARAM_gasOffRPM = "gasOffRPM";                       //RPM at which gas valve will be turned off
+char* PARAM_starterOffRPM = "starterOffRPM";               //RPM at which starter motor will be turned off
+char* PARAM_fuelOnRPM = "fuelOnRPM";                       //RPM at which fuel pump will be switched on
+char* PARAM_pumpOnValue = "pumpOnValue";                  //Initial value of fuel pump as fuel pumps donot start pumping until a certain input value
+char* PARAM_purgeTime = "purgeTime";                       //Time for which engine will run at purge throttle without fuel or gas to clear the engine at begining
+char* PARAM_purgeThrottle = "purgeThrottle";               //Throttle for purge operation in begining
+char* PARAM_starterIncDelay = "starterIncDelay";           //Delay built into starter control to limit the rate of change of starter RPM
+char* PARAM_starterLimit="starterLimit";                 //Used for brushless starter to stop at Throttle=starterLimit
+char* PARAM_accelerationDelay = "accelerationDelay";       //Delay built in to limit fuel flow increase to avoid dumping too much fuel into engine
+char* PARAM_decelerationDelay = "decelerationDelay";       //Delay built in to limit fuel flow decrease to avoid flameout by starving the engine
+char* PARAM_lowDecelDelay = "lowDecelDelay";       //Delay built in to limit fuel flow decrease to avoid flameout by starving the engine
+char* PARAM_lowAccelDelay = "lowAccelDelay";       //Delay built in to limit fuel flow decrease to avoid flameout by starving the engine
+char* PARAM_ignitionThreshold = "ignitionThreshold";       //Temperture above which ignition will be detected
+char* PARAM_noIgnitionThreshold="noIgnitionThreshold";     //Time in milliseconds after which startup sequence will be aborted due to no ignition
+char* PARAM_fuelFlowDetectionTime="fuelFlowDetectionTime"; //Time in which engine should reach a certain RPM after starting fuel pump (Startup only)
+char* PARAM_fuelFlowDetectionRPM="fuelFlowDetectionRPM";   //RPM to reach to confirm that engine is running on fuel and not on gas only
+char* PARAM_trialModeFuelOnRPM="trialModeFuelOnRPM";   //RPM to reach to when fuel will be switched on for lubricating the bearings
+char* PARAM_trialModeFuelFlow="trialModeFuelFlow";     //Fuel Flow to pump in Starter Only test mode to lubricate bearings
+char* PARAM_startingTemp="startingTemp";                  //maximum temperature for starting phase
+char* PARAM_maxTempGrad="maxTempGrad";                  //maximum temperature for starting phase
+char* PARAM_maxMotorVolt="maxMotorVolt";                  //maximum motor voltage. this allows motors with less voltage limit to be used with bigger battery packs
+char* PARAM_maxPumpVolt="maxPumpVolt";                  //maximum fuel pump voltage. this allows fuel pumps with less voltage limit to be used with bigger battery packs
+char* PARAM_MIN_MICROS = "MIN_MICROS";              //minimum microseconds for servo control
+char* PARAM_MAX_MICROS = "MAX_MICROS";                //maximum microseconds for servo control
+char* PARAM_voltIn = "voltIn";                //Input voltage
+char* PARAM_WiFiSSID = "WiFiSSID";                //Wifi Name/SSID
+char* PARAM_WiFiPWD = "WiFiPWD";                //WiFi Password
 
  
- String inputmaxTemp;
- String inputmaxRPM;
- String inputcpr;
- String inputidleRPM;
- String inputrpmTolerance;
- String inputglowOnRPM ;
- String inputglowOffRPM;
- String inputignitionRPMHigh ;
- String inputignitionRPMLow ;
- String inputgasOnRPM;
- String inputgasOffRPM ;
- String inputstarterOffRPM ;
- String inputfuelOnRPM ;
- String inputpumpOnValue ;
- String inputpurgeTime ;
- String inputpurgeThrottle;
- String inputstarterIncDelay;
- String inputstarterLimit;
- String inputaccelerationDelay;
- String inputdecelerationDelay;
- String inputlowAccelDelay;
- String inputlowDecelDelay;
- String inputignitionThreshold;
- String inputnoIgnitionThreshold;
+String inputmaxTemp;
+String inputmaxRPM;
+String inputcpr;
+String inputidleRPM;
+String inputrpmTolerance;
+String inputglowOnRPM ;
+String inputglowOffRPM;
+String inputignitionRPMHigh ;
+String inputignitionRPMLow ;
+String inputgasOnRPM;
+String inputgasOffRPM ;
+String inputstarterOffRPM ;
+String inputfuelOnRPM ;
+String inputpumpOnValue ;
+String inputpurgeTime ;
+String inputpurgeThrottle;
+String inputstarterIncDelay;
+String inputstarterLimit;
+String inputaccelerationDelay;
+String inputdecelerationDelay;
+String inputlowAccelDelay;
+String inputlowDecelDelay;
+String inputignitionThreshold;
+String inputnoIgnitionThreshold;
 String inputfuelFlowDetectionTime;
 String inputfuelFlowDetectionRPM;
 String inputtrialModeFuelOnRPM;
@@ -233,14 +220,11 @@ String inputstartingTemp;
 String inputmaxTempGrad;
 String inputmaxMotorVolt;
 String inputmaxPumpVolt;
- String inputMIN_MICROS ;
- String inputMAX_MICROS ;
-  String inputvoltIn ;
- String inputWiFiSSID ;
- String inputWiFiPWD ;
-
-
-
+String inputMIN_MICROS ;
+String inputMAX_MICROS ;
+String inputvoltIn ;
+String inputWiFiSSID ;
+String inputWiFiPWD ;
 
 //Output Servo PPM Signal min and max times in microseconds
 int MIN_MICROS=      1000;  
@@ -289,15 +273,15 @@ int startStage=startStage0;  //At startup start with engine purge
 
 bool RPMIncrease=false;//variable to cause starter to oscillate betweem ignitionRPMHigh and ignitionRPMLow until ignition 
 #define serverLoopTime  300// update web server data terminal every 300ms
-#define sdLoopTime   200 //snapshot of current data is written to SD card every 200 ms
+#define fsLoopTime   200 //snapshot of current data is written to Flash every 200 ms
 #define rpmLoopTime   100  //RPM is calculated every 100ms
 #define tempLoopTime  100  //Temp is measured every 100ms as that is time for max31855 to acquire one reading
 #define rcLoopTime   20  //RC Signal is calculated every 20ms
 #define voltageLoopTime 500 //battery voltage is measured every half second
 #define saveUsageTime 60000 //Save engine usage data every minute
-#define sdMaxTime 35  //if SD write takes more than 35ms for sdMaxCount in a row stop writing to SD card
+#define fsMaxTime 35  //if Flash write takes more than 35ms for fsMaxCount in a row stop writing
 
-long sdLoopTimeOld=0; //to store last time SD card was updated
+long fsLoopTimeOld=0; //to store last time Flash was updated
 long voltageLoopTimeOld=0; //to store last time battery voltage was updated
 long startStageTimeOld=0; //To keep track of time elapsed during start stage
 long outputMillisOld=0;// variable to store millis value for calculating accel/deccel delay
@@ -370,15 +354,12 @@ int RPMHoldGrad=          500; //RPM control will react if rpmGrad is higher tha
 int RPMRiseGrad=         20000;  //RPM Rise rate of 20000 RPM/Sec
 int RPMDropGrad=         -10000;  //RPM Drop rate of 10000 RPM/Sec
 
-
-
-
 // Other variables
 
 volatile long measuredLoopTime=0;//main loop time measurement
-volatile long sdWriteTime=0;
+volatile long fsWriteTime=0;
 volatile long maxLoopTime=0;
-int sdMaxCount=0; // no of times sdWrite time has exceeded max limit
+int fsMaxCount=0; // no of times fsWrite time has exceeded max limit
 volatile byte errorCode=0; //1 = no Ignition,2=max temp exceeded,4=max RPM exceeded, 8=no RC signal,16=Flameout,32=RPM , 64= No Fuel Failure,128=Unable to reach Idle RPM with full motor power//use by setting and reading bits
 bool ignitionState=false;//default state
 
@@ -423,22 +404,50 @@ float voltCorrection=1; //correction factor applied to resistance ratio to get a
 float voltage=0;//Calculated voltage value
 //Variables to store data at Abort condition
 
- int abRPMAvg=0;
- int abexTemp=0;
- int abfuelFlowTarget=0; //output signal for fuel pump  0-1000
- int abfuelFlowNow=0; //output signal for fuel pump  0-1000
- int abstartMotorTarget=0;// output signal for starter motor 0-1000
- int abstartMotorNow=0;// output signal for starter motor 0-1000
- bool abgasFlow=false; //gas valve for starting
- bool abfuelFlow=false; //gas valve for starting
- bool abignitionState=false;
- int abrcModeSignal=0;
- int abrcThrottleSignal=0;
- int abglowPower=0;//Stop Glow plug if On
- int abengineMode=0;
-  int abstartStage=0;
+int abRPMAvg=0;
+int abexTemp=0;
+int abfuelFlowTarget=0; //output signal for fuel pump  0-1000
+int abfuelFlowNow=0; //output signal for fuel pump  0-1000
+int abstartMotorTarget=0;// output signal for starter motor 0-1000
+int abstartMotorNow=0;// output signal for starter motor 0-1000
+bool abgasFlow=false; //gas valve for starting
+bool abfuelFlow=false; //gas valve for starting
+bool abignitionState=false;
+int abrcModeSignal=0;
+int abrcThrottleSignal=0;
+int abglowPower=0;//Stop Glow plug if On
+int abengineMode=0;
+int abstartStage=0;
 float  abvoltage=voltage;
 byte  aberrorCode=errorCode;
+
+// --- Helper Functions required for LittleFS Replacement --- //
+void appendFile(fs::FS &fs, const char * path, const char * message) {
+    File file = fs.open(path, FILE_APPEND);
+    if (!file) {
+        Serial.println("Failed to open file for appending");
+        return;
+    }
+    file.print(message);
+    file.close();
+}
+
+void LittleFS_deleteAll() {
+    LittleFS.format();
+}
+
+void LittleFS_file_delete(String filename) {
+    LittleFS.remove(filename);
+}
+
+void saveSettings() {
+    File sFile = LittleFS.open(settingsfilename, FILE_WRITE);
+    if(sFile){
+        sFile.println(getSensorReadings()); 
+        sFile.close();
+    }
+}
+// --------------------------------------------------------- //
 
 //RPM Counter
  void IRAM_ATTR CounterOverflow(void *arg) {                  // Interrupt for overflow of pulse counter
@@ -467,13 +476,9 @@ void IRAM_ATTR isr_2() {  //RC Mode Signal Measurement
 
  }
 
-
-
 //  constants stored in EEPROM
 Preferences preferences;
 
-
- 
 void setup(void) {
   
 Serial.begin(115200);
@@ -509,7 +514,6 @@ initPulseCounter ();
 
 myMAX31855.begin();
 
-
 // Allow allocation of all timers
   //ESP32PWM::allocateTimer(0);//Timer 0 now used for pulse counter
   ESP32PWM::allocateTimer(1);
@@ -542,21 +546,17 @@ preferences.end();
 Serial.print("ECU Powerup cycles  ");
 Serial.println(startCount);   
  
-
-
- 
- 
 //Initialize all timers/counters
 
-  mainLoopTimeOld=serverLoopTimeOld=sdLoopTimeOld=RPMLoopTimeOld=RCLoopTimeOld=voltageLoopTimeOld=tempTimeOld=RCSignalmillis=millis();
-//Create Task on core 0 to run SD recording loop
+  mainLoopTimeOld=serverLoopTimeOld=fsLoopTimeOld=RPMLoopTimeOld=RCLoopTimeOld=voltageLoopTimeOld=tempTimeOld=RCSignalmillis=millis();
+//Create Task on core 0 to run Logging loop
 xTaskCreatePinnedToCore(
                     Task1code,   /* Task function. */
-                    "sdTask",     /* name of task. */
+                    "fsTask",     /* name of task. */
                     10000,       /* Stack size of task */
                     NULL,        /* parameter of the task */
                     1,           /* priority of the task */
-                    &sdTask,      /* Task handle to keep track of created task */
+                    &fsTask,      /* Task handle to keep track of created task */
                     0);          /* pin task to core 0 */                  
 
 
@@ -569,7 +569,7 @@ void loop(void) {
    Serial.print("loop() running on core ");
   Serial.println(xPortGetCoreID());
   WebServerFunction();//Start webserver if 5 seconds have passed and WiFi server is not started
-  initSD();//Start SD recording
+  initLittleFS();//Start Flash recording
  }
  
  if(serverStarted) dnsServer.processNextRequest();//process DNS request
@@ -629,11 +629,9 @@ void loop(void) {
 
 //Task1code: This is like a second loop functioning running on core0. By default main loop runs on Core 1 of ESP32
 void Task1code( void * pvParameters ){
-//  Serial.print("Task1 running on core ");
-  //Serial.println(xPortGetCoreID());
 //This function will run forever, like a second loop function
   for(;;){      
-   if(sdavailable && writefile)  SaveData();
+   if(fsavailable && writefile)  SaveData();
         vTaskDelay(10 / portTICK_PERIOD_MS);
   } 
 }
@@ -1291,13 +1289,7 @@ void ControlOutput()
   if (startMotorTarget>(startMotorNow+1)) startMotorTarget=startMotorNow+1;
   if (startMotorTarget<(startMotorNow-1)) startMotorTarget=startMotorNow-1;
 }
-/*
-//scale according to motor voltage
- if (voltage>0) {
-    startMotorTarget=int(round(startMotorTarget*(maxMotorVolt/voltage)));//Scale motor output according to battery used
-   fuelFlowTarget=int(round(fuelFlowTarget*(maxPumpVolt/voltage)));//Scale fuel pump output according to battery used
-  }
- */
+
   if (fuelFlowTarget>outMax) fuelFlowTarget=outMax;
   
   if (pumpOnValue>outMin)
@@ -1429,8 +1421,8 @@ void BtnADoubleClick(void)
 // Get Sensor Readings and return JSON object
 String getSensorReadings(){
   DynamicJsonDocument readings(2048);
-  if (sdavailable&&writefile) readings["datafilename"] = filename;
-  else if (!sdavailable) readings["datafilename"] = "File Write Error";
+  if (fsavailable&&writefile) readings["datafilename"] = filename;
+  else if (!fsavailable) readings["datafilename"] = "File Write Error";
   else if (!writefile) readings["datafilename"] = "Data recording stopped";
   readings["temperature"] = String(exTemp);
   readings["tempGrad"] = String(tempGrad);
@@ -1443,8 +1435,8 @@ String getSensorReadings(){
   readings["batvolt"]=String(voltage);
   char tempbuffer[16];
   char tempbuffer2[16];
- ltoa(sdWriteTime,tempbuffer,10);
-readings["sdlooptime"]= tempbuffer; 
+ ltoa(fsWriteTime,tempbuffer,10);
+readings["sdlooptime"]= tempbuffer; // Left as sdlooptime for frontend compat
 ltoa(maxLoopTime,tempbuffer2,10);
 readings["looptime"]= tempbuffer2;
   maxLoopTime=0;//reset maxLoopTime
@@ -1493,9 +1485,6 @@ void WebServerFunction()
      Serial.println(WiFi.softAPIP());
         serverStarted=true; //WebServer has been started
         digitalWrite(LEDPin_1,LOW);
-     //  u8g2.clearBuffer();
-       //    u8g2.drawStr(1,30,"Starting Wifi WebServer"); 
-       //u8g2.sendBuffer();
        delay(3000);
 //send webpage
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -1565,7 +1554,6 @@ request->send(200, "text/html", htmlPage5);
 //Stop recording will stop recording data 
  server.on("/StopRecording", HTTP_GET, [](AsyncWebServerRequest *request){
   writefile=false;
-    //SD_MMC.close(file);
     digitalWrite(LEDPin_2,HIGH);
  
  request->send(200, "text/html", htmlPage5);
@@ -1581,12 +1569,12 @@ request->send(200, "text/html", htmlPage5);
 //New File will open a new file and start recording data on the new file 
  server.on("/NewFile", HTTP_GET, [](AsyncWebServerRequest *request){
   if(file) file.flush();
-  initSD();
+  initLittleFS();
   request->send(200, "text/html", htmlPage5);
 });
 //Delete all files and start from a new data file
  server.on("/DeleteAll", HTTP_GET, [](AsyncWebServerRequest *request){
- SD_deleteAll();
+ LittleFS_deleteAll();
   request->send(200, "text/html", htmlPage5);
 });
 //RPM Sensor type hall
@@ -1615,35 +1603,28 @@ request->send(200, "text/html", htmlPage5);
     if (request->hasParam("download")) {
      String downloadfilename = request->getParam("download")->value();
      Serial.println(downloadfilename);
-     File file2 = SD_MMC.open("/"+ssid+"/"+downloadfilename, "r");//adding root path
+     File file2 = LittleFS.open("/"+ssid+"/"+downloadfilename, "r");//adding root path
      unsigned long downloadsize = file2.size();
      
-      //String contentType = "text/plain";
       String contentType = "application/octet-stream";
      
       AsyncWebServerResponse *response = request->beginResponse(contentType, downloadsize, [file2](uint8_t *buffer, size_t maxLen, size_t total) mutable ->  size_t
                                                                { 
        return file2.read(buffer, maxLen); });
-    //  response->setContentType("application/octet-stream");//for downloading file
     downloadfilename.toUpperCase();
-     // String fname="\"" + downloadfilename + "\"";
      String fname=downloadfilename;
-    //  response->addHeader( "Content-Disposition","attachment;downloadfilename="+fname);
   response->addHeader( "Content-Disposition","attachment;filename="+fname);
-      //response->addHeader("Server", "ESP Async Web Server");
          request->send(response);
          
    }
- //   request->send(200, "text/html", htmlPage8);
   
   });
    server.on("/delete", HTTP_GET, [](AsyncWebServerRequest * request) {
     Serial.println("Deleting file...");
-   // Select_File_For_Function("[DELETE]", "deletehandler"); // Build webpage ready for display
    if (request->hasParam("delete")) {
      String deletefilename= request->getParam("delete")->value();
      Serial.println(deletefilename);
-     SD_file_delete(deletefilename);
+     LittleFS_file_delete(deletefilename);
     }
     request->send(200, "text/html", htmlPage8);
   });
@@ -1779,9 +1760,6 @@ DynamicJsonDocument docpage2(8192);
     if (request->hasParam(PARAM_ServerState)) {
       inputMessage = request->getParam(PARAM_ServerState)->value();
       inputParam = PARAM_ServerState;
-     // digitalWrite(output, inputMessage.toInt());
-    //  ledState = !ledState;
-   
     }
     else {
       inputMessage = "No message sent";
@@ -2162,18 +2140,6 @@ dnsServer.start(53, "*", WiFi.softAPIP());
 
    }
    
-
-//Following functions are working but not used as they are consuming excessive time and slow down the main loop
-    // Write the sensor readings on the SD card
-void LogSDCard() {
- 
- appendFile(SD_MMC,filename,Data.substring(0,1024).c_str());//The substring() method returns the part of the string from the start index up to and excluding the end index, or to the end of the string if no end index is supplied.
-   Data.remove(0,1024);    //public string Remove (int startIndex, int count);
-   //Data=""; //Empty data string
- 
-}
-
-
 void SaveDataHeader()
 {
 Data="";
@@ -2211,17 +2177,17 @@ Data+="Error";
 Data+=",";
 Data+="Loop Time";
 Data+=",";
-Data+="SD Write Time";
+Data+="Flash Write Time";
 Data+=",";
 Data+="Message";
 Data+='\n';
-appendFile(SD_MMC,filename,Data.c_str());
+appendFile(LittleFS,filename,Data.c_str());
 Data=""; //Empty data string
   }
 void SaveData()//Called from Main Loop
 {
 float x=millis()/1000.0;
- if(( millis()-sdLoopTimeOld)>sdLoopTime)
+ if(( millis()-fsLoopTimeOld)>fsLoopTime)
   {
 Data+=x;
 Data+=",";
@@ -2266,48 +2232,46 @@ Data+=errorCode;
 Data+=",";
 Data+=measuredLoopTime;
 Data+=",";
-Data+=sdWriteTime;
+Data+=fsWriteTime;
 Data+=",";
 Data+=sysMsg;
 Data+='\n';
 sysMsg="";//Clear sysMsg so it does not repeat without a trigger
-if((sdavailable)) 
+if((fsavailable)) 
 { 
   if (Data.length()>1024)
 {
- // Serial.print(Data.length());
-//Serial.print(" ");
-  sdWriteTime=millis();
-  LogSDCard(); 
-  sdWriteTime=millis()- sdWriteTime; //calculating time to write to SD card
+  fsWriteTime=millis();
+  appendFile(LittleFS,filename,Data.substring(0,1024).c_str());
+  Data.remove(0,1024);
+  fsWriteTime=millis()- fsWriteTime; //calculating time to write to Flash
   if(serverStarted){
-  if (sdWriteTime>(sdMaxTime+100))
- { sdMaxCount++;
-  if (sdMaxCount>1) 
+  if (fsWriteTime>(fsMaxTime+100))
+ { fsMaxCount++;
+  if (fsMaxCount>1) 
   {
-    sdavailable=false; //if SD write takes more than sdMAxTime then stop writing to SD Card. With AsyncWeb Server running, the server consumes 100ms looptime
+    fsavailable=false; //if Flash write takes more than fsMaxTime then stop writing
      digitalWrite(LEDPin_2,HIGH);
   }
     }
-  else sdMaxCount=0;
+  else fsMaxCount=0;
   }
   
-  else if(sdWriteTime>(sdMaxTime)) 
+  else if(fsWriteTime>(fsMaxTime)) 
   {
-     sdMaxCount++;
-    if (sdMaxCount>1) 
+     fsMaxCount++;
+    if (fsMaxCount>1) 
     {
-      sdavailable=false; //if SD write takes more than sdMAxTime then stop writing to SD Card
+      fsavailable=false; //if flash write takes more than limit then stop writing to flash
        digitalWrite(LEDPin_2,HIGH);    
     }
     
   }
-  else sdMaxCount=0;
-  //Serial.println(sdWriteTime);
+  else fsMaxCount=0;
 }
 }
 
-sdLoopTimeOld=millis();
+fsLoopTimeOld=millis();
 
   }
      
@@ -2340,7 +2304,6 @@ sdLoopTimeOld=millis();
     // resetting counter as if example, delet for application in PiedPiperS
     OverflowCounter = 0;                                       // set overflow counter to zero
     pcnt_counter_clear(PCNT_FREQ_UNIT);                        // zero and reset of pulse counter unit
-    //conterOK = true;                                         // not in use, copy from example code ########################################
   }
 
   void Read_PCNT() {                                           // function for reading pulse counter (for timer)
@@ -2349,7 +2312,6 @@ sdLoopTimeOld=millis();
 
   // Replaces placeholder with button section in your web page
 String processor(const String& var){
-  //Serial.println(var);
   if(var == "BUTTONPLACEHOLDER"){
     String buttons ="";
     String outputStateValue = outputState();
@@ -2387,43 +2349,29 @@ if ((millis()-engineUsageTimeOld)>saveUsageTime)
  }
 
  }
- void initSD()
+ void initLittleFS()
  {
   int x=0;
  bool result=false;
 
-  do{ result=SD_MMC.begin();
+  do{ result=LittleFS.begin(true); // true = format if mount fails
   x++;}
     while ((!result)&&(x<5));
- //  if(!SD_MMC.begin()) {
+
  if(!result) {
-    Serial.println("Card Mount Failed");
-    sdavailable=false;
-   // return;
+    Serial.println("LittleFS Mount Failed");
+    fsavailable=false;
   } else 
   {
-    Serial.println("Card Mount Success");
-    sdavailable=true;
-    // Initialize SD card for saving data to file this code is for 4 wire sd interface
-
-/* 
-  uint8_t cardType = SD_MMC.cardType();
-  if(cardType == CARD_NONE) {
-    Serial.println("No SD card attached");
-    sdavailable=false;
- 
-  }*/
+    Serial.println("LittleFS Mount Success");
+    fsavailable=true;
   }
   
-if(!dirpresent)listDir(SD_MMC, "/", 0);
+  // Ensure the directory exists if needed for LittleFS
+  if (!LittleFS.exists("/" + ssid)) {
+      LittleFS.mkdir("/" + ssid);
+  }
   
-//file = SD_MMC.open(filename);
-
-  // If the data.txt file doesn't exist
-  // Create a file on the SD card 
- 
- //  File file;
- 
   if(file) file.close();
  do {
   if(file) file.close();
@@ -2434,59 +2382,47 @@ if(!dirpresent)listDir(SD_MMC, "/", 0);
   fnametemp.toCharArray(filename,32);
   String settingsfnametemp="/"+ssid+"/Settings"+seq+".txt";
   settingsfnametemp.toCharArray(settingsfilename,32);
- // Serial.println(filename);
- file = SD_MMC.open(filename);
+ file = LittleFS.open(filename, "r");
   } while(file);
     saveSettings();
-    file = SD_MMC.open(filename,FILE_APPEND);
+    file = LittleFS.open(filename,FILE_APPEND);
     SaveDataHeader();
   if (file){ 
-   sdavailable=true;
+   fsavailable=true;
    Serial.print("File opened ");
   Serial.println(filename);
   digitalWrite(LEDPin_2,LOW);
- // file.close();
  } else 
  {
   Serial.print("Failed to open file");
-  sdavailable=false;
+  fsavailable=false;
   digitalWrite(LEDPin_2,HIGH);
  }
  
    }
 
 String page8processor(const String& var){
-  //Serial.println(var);
   if(var == "PAGE8PLACEHOLDER"){
     String webpage="";
     String path="/"+ssid;
-     File root = SD_MMC.open(path);
+     File root = LittleFS.open(path);
      if(!root) 
      {
-      webpage+=" SD Card not available";
+      webpage+=" Storage not available";
       return webpage;
      }
       if(!root.isDirectory()){
         Serial.println("Root failure");
-   webpage+=" SD Card not available";
+   webpage+=" Storage not available";
       return webpage;
   }
   webpage += F("<table align='center'>");
       webpage += F("<tr><th>Name</th><th>Size</th></tr>");
   File dirfile = root.openNextFile();
-   // int i = 0;
   while(dirfile){
  
-    if(dirfile.isDirectory()){
- //     webpage += "<tr><td>"+String(file.isDirectory()?"Dir":"File")+"</td><td>"+String(file.name())+"</td><td></td></tr>";
-  //  Serial.println("Directory file");
-//     printDirectory(file.name(), levels-1);
-    }
-      else
-    {
-    //   Serial.println(dirfile.name());
+    if(!dirfile.isDirectory()){
       webpage += "<tr><td>"+String(dirfile.name())+"</td>";
-  //  webpage += "<td>"+String(file.isDirectory()?"Dir":"File")+"</td>";
       int bytes = dirfile.size();
       String fsize = "";
       if (bytes < 1024)                     fsize = String(bytes)+" B";
@@ -2506,322 +2442,12 @@ String page8processor(const String& var){
            webpage += F("' value='"); webpage +=String("/"+ssid+"/"+dirfile.name()); webpage +=F("'>Delete</button>");
          webpage += F("</FORM>"); 
       webpage += "</td>";
-    //  webpage += "</tr>";
-
+      webpage += "</tr>";
     }
     dirfile = root.openNextFile();
-   // i++;
   }
-  dirfile.close();
-    return webpage;
+   webpage += F("</table>");
+  return webpage;
   }
   return String();
-}
-
-
-
-//Delete a file from the SD, it is called in void SD_dir()
-void SD_file_delete(String deletefilename) 
-{ 
-  if (sdavailable) { 
-  
-    File dataFile = SD_MMC.open(deletefilename, FILE_READ); //Now read data from SD Card 
-    if (dataFile)
-    {
-      dataFile.close();
-      if (SD_MMC.remove(deletefilename)) {
-        Serial.println(F("File deleted successfully"));
-        webpage += "<h3>File '"+deletefilename+"' has been erased</h3>"; 
-        webpage += F("<br><br><br><a href='/page8'>[Back]</a><br><br>");
-            }
-      else
-      { 
-        webpage += F("<br><br><br><h3>File was not deleted - error</h3>");
-        webpage += F("<br><br><br><a href='/'>[Back]</a><br><br>");
-      }
-    } else  Serial.println(F("File deleted successfully"));
-  
-  } else  Serial.println(F("File Not Present"));
-} 
-
-void SD_deleteAll(void) 
-{
-  sdavailable=false;
-   //  File file;
-  fileseq=0;
- do {
-  if(file) 
-  {
-  file.close();
-  digitalWrite(LEDPin_2,HIGH);
-   SD_MMC.remove(filename);
-   }
-  fileseq++;
-  char seq[4];
-  itoa(fileseq,seq,10);
-  String fnametemp="/"+ssid+"/Data"+seq+".txt";
-  fnametemp.toCharArray(filename,32);
- // Serial.println(filename);
- file = SD_MMC.open(filename);
-  } while(file);
-  //REmoving Settings files
-   fileseq=0;
-do {
-  if(file) 
-  {
-  file.close();
-  digitalWrite(LEDPin_2,HIGH);
-   SD_MMC.remove(filename);
-   }
-  fileseq++;
-  char seq[4];
-  itoa(fileseq,seq,10);
-  String fnametemp="/"+ssid+"/Settings"+seq+".txt";
-  fnametemp.toCharArray(filename,32);
- // Serial.println(filename);
- file = SD_MMC.open(filename);
-  } while(file);
-  
-  fileseq=0;
-  initSD();
-}
-
-void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
-    Serial.printf("Listing directory: %s\n", dirname);
-   
- 
-    File root=fs.open(dirname);
-  
-    if(!root){
-        Serial.println("Failed to open directory");
-        return;
-    }
-    if(!root.isDirectory()){
-        Serial.println("Not a directory");
-        return;
-    }
-
-    File file = root.openNextFile();
-    while(file){
-        if(file.isDirectory()){
-            Serial.print("  DIR : ");
-            Serial.println(file.name());
-            if (0==strcmp(file.name(),ssid.c_str())) {
-              dirpresent=true;
-              Serial.print(file.name());
-            }
-            if(levels){
-                listDir(fs, file.path(), levels -1);
-            }
-        } else {
-       //     Serial.print("  FILE: ");
-       //     Serial.print(file.name());
-        //    Serial.print("  SIZE: ");
-        //    Serial.println(file.size());
-        }
-        file = root.openNextFile();
-    }
-    String path="/"+ssid;
-    if(!dirpresent) {
-      createDir(SD_MMC,path.c_str());
-      Serial.printf("new directory created %s", ssid);
-    }
-    else Serial.println("Directory exists "+ path);
-}
-
-
-void createDir(fs::FS &fs, const char * path){
-    Serial.printf("Creating Dir: %s\n", path);
-    if(fs.mkdir(path)){
-        Serial.println("Dir created");
-    } else {
-        Serial.println("mkdir failed");
-    }
-}
-
-void removeDir(fs::FS &fs, const char * path){
-    Serial.printf("Removing Dir: %s\n", path);
-    if(fs.rmdir(path)){
-        Serial.println("Dir removed");
-    } else {
-        Serial.println("rmdir failed");
-    }
-}
-
-void writeFile(fs::FS &fs, const char * path, const char * message){
-   // Serial.printf("Writing file: %s\n", path);
-
-    File file = fs.open(path, FILE_WRITE);
-    if(!file){
-     //   Serial.println("Failed to open file for writing");
-        return;
-    }
-    if(file.print(message)){
-      file.flush();
-       // Serial.println("File written");
-    } else {
-       // Serial.println("Write failed");
-    }
-}
-
-void appendFile(fs::FS &fs, const char * path, const char * message){
- //   Serial.printf("Appending to file: %s\n", path);
-
- //   File file = fs.open(path, FILE_APPEND);
-    if(!file){
-        Serial.println("Failed to open file for appending");
-        sdavailable=false;
-        return;
-    }
-    if(file.print(message)){
-            file.flush();
-    
-     // Serial.println("Message appended ");
-   //     file.close();
-            } else {
-     //   Serial.println("Append failed");
-        sdavailable=false;
-    }
-}
-
-void saveSettings()
-{
-
-    file = SD_MMC.open(settingsfilename,FILE_APPEND);
-    
-  Serial.println(settingsfilename);
-String settingsdata="";
-settingsdata+="RPM Sensor Type";
-settingsdata+=",";
-if (cpr==1)settingsdata+="Magnetic";
-else settingsdata+="Optical";
-settingsdata +='\n';
-settingsdata+="maxRPM";
-settingsdata+=",";
-settingsdata+=maxRPM;
-settingsdata +='\n';
-settingsdata+="maxTemp";
-settingsdata+=",";
-settingsdata+=maxTemp;
-settingsdata +='\n';
-settingsdata+="idleRPM";
-settingsdata+=",";
-settingsdata+=idleRPM;
-settingsdata +='\n';
-settingsdata+="rpmTolerance";
-settingsdata+=",";
-settingsdata+=rpmTolerance;
-settingsdata +='\n';
-settingsdata+="glowOnRPM";
-settingsdata+=",";
-settingsdata+=glowOnRPM;
-settingsdata +='\n'; 
-settingsdata+="glowOffRPM";
-settingsdata+=",";
-settingsdata+=glowOffRPM;
-settingsdata +='\n';
-settingsdata+="ignitionRPMHigh";
-settingsdata+=",";
-settingsdata+=ignitionRPMHigh;
-settingsdata +='\n';
-settingsdata+="ignitionRPMLow";
-settingsdata+=",";
-settingsdata+=ignitionRPMLow;
-settingsdata +='\n';
-settingsdata+="gasOnRPM";
-settingsdata+=",";
-settingsdata+=gasOnRPM;
-settingsdata +='\n';   
-settingsdata+="gasOffRPM";
-settingsdata+=",";
-settingsdata+=gasOffRPM;
-settingsdata +='\n';
-settingsdata+="starterOffRPM";
-settingsdata+=",";
-settingsdata+=starterOffRPM;
-settingsdata +='\n'; 
-settingsdata+="fuelOnRPM";
-settingsdata+=",";
-settingsdata+=fuelOnRPM;
-settingsdata +='\n';  
-settingsdata+="pumpOnValue";
-settingsdata+=",";
-settingsdata+=pumpOnValue;
-settingsdata +='\n';   
-settingsdata+="purgeThrottle";
-settingsdata+=",";
-settingsdata+=purgeThrottle;
-settingsdata +='\n';  
-settingsdata+="purgeTime";
-settingsdata+=",";
-settingsdata+=purgeTime;
-settingsdata +='\n';
-settingsdata+="starterIncDelay";
-settingsdata+=",";
-settingsdata+=starterIncDelay;
-settingsdata +='\n';   
-settingsdata+="starterLimit";
-settingsdata+=",";
-settingsdata+=starterLimit;
-settingsdata +='\n';
-settingsdata+="noIgnitionThreshold";
-settingsdata+=",";
-settingsdata+=noIgnitionThreshold;
-settingsdata +='\n';
-settingsdata+="ignitionThreshold";
-settingsdata+=",";
-settingsdata+=ignitionThreshold;
-settingsdata +='\n';
-settingsdata+="fuelFlowDetectionTime";
-settingsdata+=",";
-settingsdata+=fuelFlowDetectionTime;
-settingsdata +='\n';
-settingsdata+="fuelFlowDetectionRPM";
-settingsdata+=",";
-settingsdata+=fuelFlowDetectionRPM;
-settingsdata +='\n';
-settingsdata+="trialModeFuelOnRPM";
-settingsdata+=",";
-settingsdata+=trialModeFuelOnRPM;
-settingsdata +='\n';
-settingsdata+="trialModeFuelFlow";
-settingsdata+=",";
-settingsdata+=trialModeFuelFlow;
-settingsdata +='\n';
-settingsdata+="startingTemp";
-settingsdata+=",";
-settingsdata+=startingTemp;
-settingsdata +='\n';
-settingsdata+="maxTempGrad";
-settingsdata+=",";
-settingsdata+=maxTempGrad;
-settingsdata +='\n';
-settingsdata+="MIN_MICROS";
-settingsdata+=",";
-settingsdata+=MIN_MICROS;
-settingsdata +='\n';
-settingsdata+="MAX_MICROS";
-settingsdata+=",";
-settingsdata+=MAX_MICROS;
-settingsdata +='\n';
-settingsdata+="accelerationDelay";
-settingsdata+=",";
-settingsdata+=accelerationDelay;
-settingsdata +='\n';
-settingsdata+="decelerationDelay";
-settingsdata+=",";
-settingsdata+=decelerationDelay;
-settingsdata +='\n'; 
-settingsdata+="lowAccelDelay";
-settingsdata+=",";
-settingsdata+=lowAccelDelay;
-settingsdata +='\n';  
-settingsdata+="lowDecelDelay";
-settingsdata+=",";
-settingsdata+=lowDecelDelay;
-settingsdata +='\n'; 
-
-appendFile(SD_MMC,settingsfilename,settingsdata.c_str());
-file.flush();
-file.close();
 }
