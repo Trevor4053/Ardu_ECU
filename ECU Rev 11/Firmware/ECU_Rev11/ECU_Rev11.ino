@@ -73,6 +73,7 @@ Note: All settings in this sequence are changeable through web interface
 #include <MAX31855.h>
 #include <ESP32Servo.h> 
 #include <EasyButton.h>
+#include <LiquidCrystal_I2C.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
@@ -104,21 +105,33 @@ bool writefile=true; //only write file if this variable is true
 String Data="";//Data string to be logged to Flash
 String sysMsg="";//system Message
 
-#define MAXCS                  5 //SPI Thermocouple CS 
-#define LEDPin_1               16 
-#define LEDPin_2               17 
-#define ThermoSCK            18
-#define ThermoSD             19
-#define StarterPin           23  
-#define Button_Pin           25
-#define GlowPin              26
-#define FuelPumpPin          27
-#define Fuel_Solenoid_Pin    32
-#define GasPin               33
-#define voltsensorPin        34
-#define RPMsensorPin         35  
-#define RC_Mode_Pin          36 
-#define RC_Throttle_Pin      39 
+//I2C 16x2 LCD display
+LiquidCrystal_I2C lcd(0x27, 16, 2);      //default PCF8574 address 0x27, 16 cols x 2 rows
+char lcdLine1[17]="";                    //last written line 1 (for change detection)
+char lcdLine2[17]="";                    //last written line 2
+
+// --- Sensor & Analog Inputs (ADC1) ---
+#define RC_Throttle_Pin      4
+#define RC_Mode_Pin          5
+#define voltsensorPin        6
+#define RPMsensorPin         7 
+
+// --- Thermocouple (SPI) ---
+#define MAXCS                2   
+#define ThermoSCK            39
+#define ThermoSD             40
+
+// --- Display & Interface ---
+#define Button_Pin           8
+#define Display_SDA          13
+#define Display_SCL          14
+
+// --- Core Engine Control ---
+#define GasPin               15
+#define Fuel_Solenoid_Pin    16
+#define FuelPumpPin          17
+#define GlowPin              18
+#define StarterPin           21
 
 
 //counter for RPM
@@ -280,9 +293,11 @@ bool RPMIncrease=false;//variable to cause starter to oscillate betweem ignition
 #define voltageLoopTime 500 //battery voltage is measured every half second
 #define saveUsageTime 60000 //Save engine usage data every minute
 #define fsMaxTime 35  //if Flash write takes more than 35ms for fsMaxCount in a row stop writing
+#define displayLoopTime 1000 //LCD display is refreshed once per second
 
 long fsLoopTimeOld=0; //to store last time Flash was updated
 long voltageLoopTimeOld=0; //to store last time battery voltage was updated
+long displayLoopTimeOld=0; //to store last time LCD display was updated
 long startStageTimeOld=0; //To keep track of time elapsed during start stage
 long outputMillisOld=0;// variable to store millis value for calculating accel/deccel delay
 long serverLoopTimeOld=0;//variable to keep track of web server data terminal update
@@ -483,14 +498,16 @@ void setup(void) {
   
 Serial.begin(115200);
 
+//Initialize I2C 16x2 LCD display
+Wire.begin(Display_SDA, Display_SCL);
+lcd.init();
+lcd.backlight();
+lcd.clear();
+
 // Initialize GPIO Pins
 
-pinMode(LEDPin_1,OUTPUT);  
-pinMode(LEDPin_2,OUTPUT);              
 pinMode(Fuel_Solenoid_Pin,OUTPUT);
 pinMode(GasPin,OUTPUT);
-digitalWrite(LEDPin_1,HIGH);
-digitalWrite(LEDPin_2,HIGH);
 digitalWrite(Fuel_Solenoid_Pin,LOW);
 digitalWrite(GasPin,LOW);
 
@@ -582,6 +599,7 @@ void loop(void) {
   ReadRPM();
   ReadTempSensors(); //100ms loop time
   ReadVoltage();
+  UpdateDisplay(); //LCD refresh once per second
 
 //  if (errorCode==0)
 // {
@@ -647,6 +665,59 @@ void UpdateWebData()
     serverLoopTimeOld = millis();
 }
 }
+}
+
+//Update the I2C LCD. Runs once per second and only writes to the display when content changes.
+void UpdateDisplay()
+{
+  if ((millis()-displayLoopTimeOld)<displayLoopTime) return;
+  displayLoopTimeOld=millis();
+
+  char line1[17], line2[17];
+  int thr=(int)rcThrottleSignal;
+  if (thr>100) thr=100;
+  if (thr<0) thr=0;
+
+  if (errorCode==0)
+  {
+    switch(engineMode)
+    {
+      case modeWaiting:        strcpy(line1,"Waiting");       break;
+      case modeStarting:       strcpy(line1,(startStage==startStage0)?"Purge":"Ramp Up"); break;
+      case modeIdling:         strcpy(line1,"Idling");        break;
+      case modeOperating:      strcpy(line1,"Operating");     break;
+      case modeCooldown:       strcpy(line1,"Cooldown");      break;
+      case modeStarterOnly:    strcpy(line1,"Trial Starter"); break;
+      case modeFuelPumpOnly:   strcpy(line1,"Trial Fuel");    break;
+      default:                 strcpy(line1,"Unknown");       break;
+    }
+  }
+  else if (bitRead(errorCode,0)) strcpy(line1,"No Ignition");
+  else if (bitRead(errorCode,1)) strcpy(line1,"Temp Exceeded");
+  else if (bitRead(errorCode,2)) strcpy(line1,"RPM Exceeded");
+  else if (bitRead(errorCode,3)) strcpy(line1,"RC Signal Lost");
+  else if (bitRead(errorCode,4)) strcpy(line1,"Flameout");
+  else if (bitRead(errorCode,5)) strcpy(line1,"RPM Sensor Fail");
+  else if (bitRead(errorCode,6)) strcpy(line1,"No Fuel Accel");
+  else if (bitRead(errorCode,7)) strcpy(line1,"No Idle RPM");
+  else                           strcpy(line1,"Error");
+
+  snprintf(line2,17,"%d RPM %d%%",RPMAvg,thr);
+
+  if (strcmp(line1,lcdLine1)!=0)
+  {
+    lcd.setCursor(0,0);
+    lcd.print(line1);//print then pad to clear any leftover characters from previous longer text
+    for(int i=strlen(line1);i<16;i++) lcd.print(" ");
+    strcpy(lcdLine1,line1);
+  }
+  if (strcmp(line2,lcdLine2)!=0)
+  {
+    lcd.setCursor(0,1);
+    lcd.print(line2);//print then pad to clear any leftover characters from previous longer text
+    for(int i=strlen(line2);i<16;i++) lcd.print(" ");
+    strcpy(lcdLine2,line2);
+  }
 }
 
 void ReadVoltage()
@@ -1386,7 +1457,6 @@ void BtnADoubleClick(void)
   if (!serverStarted)
   {
     startServer=true;
-    digitalWrite(LEDPin_1,LOW);
     WiFi.disconnect(false);  // Reconnect the network 
        
   }
@@ -1484,7 +1554,6 @@ void WebServerFunction()
       Serial.println(password.c_str());
      Serial.println(WiFi.softAPIP());
         serverStarted=true; //WebServer has been started
-        digitalWrite(LEDPin_1,LOW);
        delay(3000);
 //send webpage
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -1554,7 +1623,6 @@ request->send(200, "text/html", htmlPage5);
 //Stop recording will stop recording data 
  server.on("/StopRecording", HTTP_GET, [](AsyncWebServerRequest *request){
   writefile=false;
-    digitalWrite(LEDPin_2,HIGH);
  
  request->send(200, "text/html", htmlPage5);
 
@@ -1562,8 +1630,7 @@ request->send(200, "text/html", htmlPage5);
 //Start recording will restart recording data on the current file 
  server.on("/StartRecording", HTTP_GET, [](AsyncWebServerRequest *request){
    writefile=true;
-   if(file)  digitalWrite(LEDPin_2,LOW);
-     
+   
   request->send(200, "text/html", htmlPage5);
 });
 //New File will open a new file and start recording data on the new file 
@@ -1777,7 +1844,6 @@ DynamicJsonDocument docpage2(8192);
     server.end();
     WiFi.disconnect(true);  // Disconnect from the network
     WiFi.mode(WIFI_OFF);    // Switch WiFi off
-    digitalWrite(LEDPin_1,HIGH);
     }
   });
 
@@ -2251,8 +2317,7 @@ if((fsavailable))
   if (fsMaxCount>1) 
   {
     fsavailable=false; //if Flash write takes more than fsMaxTime then stop writing
-     digitalWrite(LEDPin_2,HIGH);
-  }
+   }
     }
   else fsMaxCount=0;
   }
@@ -2263,7 +2328,6 @@ if((fsavailable))
     if (fsMaxCount>1) 
     {
       fsavailable=false; //if flash write takes more than limit then stop writing to flash
-       digitalWrite(LEDPin_2,HIGH);    
     }
     
   }
@@ -2391,12 +2455,10 @@ if ((millis()-engineUsageTimeOld)>saveUsageTime)
    fsavailable=true;
    Serial.print("File opened ");
   Serial.println(filename);
-  digitalWrite(LEDPin_2,LOW);
  } else 
  {
   Serial.print("Failed to open file");
   fsavailable=false;
-  digitalWrite(LEDPin_2,HIGH);
  }
  
    }
