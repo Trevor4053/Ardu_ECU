@@ -5,6 +5,7 @@ Easy to build and use Engine Control Unit (ECU) for model Jet engines :
 * Based on Arduino code and running on ESP32 based hardware
 * ECU configuration using a simpe web browser
 * Engine operating parameters displayed using a web browser interface
+* PC control and data logging via a desktop serial GUI (see [PC GUI](#pc-gui))
 * Use off the shelf components for electronics e.g.
         Brushed or brushless Speed controller for starter motor and fuel pump control
         MOSFET module for gas valve solenoid control
@@ -20,6 +21,8 @@ Easy to build and use Engine Control Unit (ECU) for model Jet engines :
 	1. [Building](#building)
 	1. [Installation](#installation)
 	1. [Usage](#usage)
+	1. [PC GUI](#pc-gui)
+	1. [Serial Interface](#serial-interface)
 4. [Release Process](#release-process)
 	1. [Versioning](#versioning)
 	1. [How to Get Help](#how-to-get-help)
@@ -109,6 +112,37 @@ The electronic schemetic is included in repository
 
 **[Back to top](#table-of-contents)**
 
+## PC GUI
+
+A desktop engine GUI + data logger for the ECU Rev 11 firmware, located in
+`ECU Rev 11/GUI/engine_gui.py`. It connects to the ECU over a USB serial port and uses
+the firmware's [Serial Interface](#serial-interface) instead of a web browser.
+
+Features:
+* Aviation-style dial gauges - RPM (0-120000, yellow arc 100000-110000, red arc 110000-120000) and EGT (0-1100 C, yellow arc 630-750, red arc 750-1100)
+* START / STOP / ABORT / RESET / RC / PING buttons, MODE 0-6 selector and Throttle 0-100 slider
+* Gas and fuel solenoid valve indicators
+* CSV + JSONL data logging of every telemetry reading, with buttons to open the log files
+* Light / Dark theme toggle and keyboard throttle control (W/S = +-1 %, X = cut to 0)
+* Automatic PING heartbeat that keeps the firmware serial override active
+* Offline self-test mode: `python engine_gui.py --selftest`
+
+Requires Python 3.8+ and pyserial. See `ECU Rev 11/GUI/README.md` for full details.
+
+**[Back to top](#table-of-contents)**
+
+## Serial Interface
+
+The ECU Rev 11 firmware exposes telemetry and control over the USB serial port (115200 baud)
+so the PC GUI and any custom client can monitor and drive the engine without the web interface.
+
+* Telemetry - one compact JSON line per second:
+  `{"t":<ms>,"mode":n,"stage":"purge|ramp|idle|op|cool|t-st|t-fuel|wait","thr":n,"modesig":n,"rpm":n,"temp":n,"volt":f,"fuel":n,"starter":n,"glow":n,"gas":0/1,"fuelv":0/1,"err":n,"loop":n}`
+* Commands (case-insensitive): `START | STOP | THROTTLE <0-100> | MODE <0-6> | SETRPM <0-100000> | SETTEMP <0-1000> | ABORT | RESET | RC | PING | HELP`, each acknowledged with `CMD:<CMD> OK` / `CMD:<CMD> ERR` / `CMD:UNKNOWN ...`
+* While a serial override is active, throttle, mode, RPM and EGT are driven by the GUI instead of the RC/switch inputs
+
+**[Back to top](#table-of-contents)**
+
 ## Release Process
 
 Release will require testing on an actual engine. 
@@ -143,6 +177,16 @@ Software corrections-DynamicJsonDoc moved from global to local- Removed OLED Dis
 * Added option for Magnetic (1 Pulse per revolution)  or Optical (2 pulses per revolution)  RPM sensor 
 * Implemented tempGradient check to limit sharp rise in exhaust temperature (tempGrad and maxTempGrad variables)
 * Implemented lookahead for temperature and stop increasing fuel flow if exhaust temp will increase above maxTemp in 3 sec (tempGrad x 3)
+
+### Rev 11 Firmware - Serial Control & Robustness Updates
+
+* Added serial telemetry and command interface (see [Serial Interface](#serial-interface))
+* Non-blocking serial command parser - incoming serial data no longer stalls the main control loop and all pending commands are drained each loop
+* Command argument validation - invalid numeric arguments (e.g. `THROTTLE abc`) are rejected with `CMD:... ERR` instead of being silently coerced
+* Serial override watchdog - if no serial traffic arrives within 5 s (`serialCmdTimeout`) the ECU automatically reverts to physical RC/switch control
+* Non-blocking error auto-reset - the 3 s error hold in WaitingFunction no longer blocks the loop, so telemetry and serial commands keep running during a fault
+* JSON-safe telemetry - battery voltage is clamped and formatted so a bad ADC reading cannot break the JSON telemetry line
+* LittleFS write guard - file appends are skipped (with a one-time warning) when the filesystem is not mounted, instead of logging errors every control-loop pass
 
 
 

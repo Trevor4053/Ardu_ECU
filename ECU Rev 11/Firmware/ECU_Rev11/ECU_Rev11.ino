@@ -133,6 +133,10 @@ char lcdLine2[17]="";                    //last written line 2
 #define GlowPin              18
 #define StarterPin           21
 
+// --- Switch & Potentiometer Control ---
+#define EngineSwitch_Pin     10   //HIGH = run engine (switch+pot control), LOW = RC control
+#define ThrottlePot_Pin       9   //potentiometer throttle 0-100% (used when EngineSwitch_Pin is HIGH)
+
 
 //counter for RPM
 #define PCNT_FREQ_UNIT      PCNT_UNIT_0                      // select ESP32 pulse counter unit 0 (out of 0 to 7 indipendent counting units)
@@ -314,6 +318,15 @@ int engineRunTime = 0; //Engine Run Time in minutes
 unsigned long rcThrottleSignal=0; //Throttle control
 unsigned long rcModeSignal=0;  //Used for startup and cool down
 
+//Switch & Potentiometer Control Variables
+bool engineSwitchOn=false;    //engine switch (IO10) state: HIGH = switch+pot control, LOW = RC control
+bool engineSwitchPrev=false;  //previous switch state for edge detection
+bool switchControlActive=false;//engine was started/controlled via the switch (disables RC signal lost fault)
+bool switchRestartArmed=true; //false after an abort: switch control must be re-cycled (or pot moved) before restart
+bool potMovedAfterAbort=false;//true when the pot has moved away from idle since the last abort (used to re-arm restart)
+int switchStableCount=0;      //debounce counter for engine switch (3 stable reads = 60ms)
+int throttlePotValue=0;       //potentiometer throttle 0-100
+
 
 
 // Engine Parameters
@@ -436,11 +449,35 @@ int abstartStage=0;
 float  abvoltage=voltage;
 byte  aberrorCode=errorCode;
 
+// --- Serial command/telemetry control (GUI interface) --- //
+bool serialCmdActive=false;       //true when serial GUI override of RC inputs is active
+int  serialCmdThrottle=0;         //serial throttle override 0-100
+bool serialCmdThrottleValid=false;//set true by THROTTLE/START commands
+int  serialCmdMode=100;           //serial mode override 0-100
+bool serialCmdModeValid=false;    //set true by MODE signal override (START/STOP)
+int  serialCmdRPM=0;              //simulated RPM override (GUI acts as virtual engine)
+bool serialCmdRPMValid=false;     //set true by SETRPM
+int  serialCmdTemp=0;             //simulated exhaust temp override (GUI acts as virtual engine)
+bool serialCmdTempValid=false;    //set true by SETTEMP
+unsigned long telemetryLoopTimeOld=0;
+unsigned long telemetryLoopTime=1000;
+String serialCmdBuf="";            //incoming serial line accumulator (non-blocking parser)
+unsigned long serialCmdLastMillis=0;//time of last received serial line (watchdog)
+unsigned long serialCmdTimeout=5000; //ms without serial traffic before reverting to physical control
+unsigned long errorResetTime=0;    //timestamp for non-blocking error auto-reset in WaitingFunction
+
 // --- Helper Functions required for LittleFS Replacement --- //
+bool fsAvailableFlag=false;   //set true once LittleFS is mounted (set in initLittleFS)
+bool fsWarned=false;          //only print the mount/open warning once
+
 void appendFile(fs::FS &fs, const char * path, const char * message) {
+    if (!fsAvailableFlag) {
+        if (!fsWarned) { Serial.println("LittleFS not mounted - skipping file append"); fsWarned=true; }
+        return;
+    }
     File file = fs.open(path, FILE_APPEND);
     if (!file) {
-        Serial.println("Failed to open file for appending");
+        if (!fsWarned) { Serial.println("Failed to open file for appending"); fsWarned=true; }
         return;
     }
     file.print(message);
@@ -515,6 +552,10 @@ pinMode(RC_Mode_Pin,INPUT);
 pinMode(RC_Throttle_Pin,INPUT);
 pinMode(voltsensorPin,INPUT);
 
+//Engine control switch (IO10) and throttle potentiometer (IO9)
+pinMode(EngineSwitch_Pin, INPUT_PULLDOWN);//default LOW, switch pulls HIGH to start engine
+pinMode(ThrottlePot_Pin, INPUT);
+
 //Setting up button -On pressing for 3 seconds, it will reset error code. Also used for switching engine modes through doubleclicks
 pinMode(Button_Pin, INPUT_PULLUP);
 buttonA.begin();//Easy Button Library initialize
@@ -579,6 +620,227 @@ xTaskCreatePinnedToCore(
 
 }
 
+//Parse serial commands from the GUI. Command names are case-insensitive.
+//START | STOP | THROTTLE <0-100> | MODE <0-6> | ABORT | RESET | RC | PING | HELP
+void ProcessSerialCommands()
+{
+  //Non-blocking parser: accumulate chars and only process complete lines,
+  //so a partial line never blocks the control loop.
+  while (Serial.available())
+  {
+    char ch=(char)Serial.read();
+    if ((ch=='\n')||(ch=='\r'))
+    {
+      if (serialCmdBuf.length()>0)
+      {
+        ProcessSerialLine(serialCmdBuf);
+        serialCmdBuf="";
+      }
+    }
+    else if (serialCmdBuf.length()<64) serialCmdBuf+=ch;
+  }
+}
+
+//Validate that arg is a non-negative integer string (rejects empty/garbage args).
+bool serialArgIsNumber(String arg)
+{
+  if (arg.length()==0) return false;
+  for (unsigned int i=0;i<arg.length();i++)
+  {
+    if ((arg[i]<'0')||(arg[i]>'9')) return false;
+  }
+  return true;
+}
+
+//Parse and execute one complete serial command line.
+void ProcessSerialLine(String cmdLine)
+{
+  cmdLine.trim();
+  if (cmdLine.length()==0) return;
+  serialCmdLastMillis=millis();//any serial traffic keeps the override watchdog alive
+
+  String cmd=cmdLine;
+  String arg="";
+  int sp=cmd.indexOf(' ');
+  if (sp>0)
+  {
+    arg=cmd.substring(sp+1);
+    cmd=cmd.substring(0,sp);
+  }
+  cmd.toUpperCase();
+  if (cmd=="START")
+  {
+    serialCmdActive=true;
+    serialCmdThrottle=0; serialCmdThrottleValid=true;
+    serialCmdMode=100;   serialCmdModeValid=true;
+    Serial.println("CMD:START OK");
+  }
+  else if (cmd=="STOP")
+  {
+    serialCmdActive=true;
+    serialCmdMode=0; serialCmdModeValid=true;
+    Serial.println("CMD:STOP OK");
+  }
+  else if (cmd=="THROTTLE")
+  {
+    if (!serialArgIsNumber(arg)) Serial.println("CMD:THROTTLE ERR");
+    else
+    {
+      int n=arg.toInt();
+      if (n<0) n=0;
+      if (n>100) n=100;
+      serialCmdActive=true;
+      serialCmdThrottle=n; serialCmdThrottleValid=true;
+      Serial.println(String("CMD:THROTTLE ")+String(n)+" OK");
+    }
+  }
+  else if (cmd=="SETRPM")
+  {
+    if (!serialArgIsNumber(arg)) Serial.println("CMD:SETRPM ERR");
+    else
+    {
+      long n=arg.toInt();
+      if (n<0) n=0;
+      if (n>100000) n=100000;
+      serialCmdActive=true;
+      serialCmdRPM=(int)n; serialCmdRPMValid=true;
+      Serial.println(String("CMD:SETRPM ")+String(n)+" OK");
+    }
+  }
+  else if (cmd=="SETTEMP")
+  {
+    if (!serialArgIsNumber(arg)) Serial.println("CMD:SETTEMP ERR");
+    else
+    {
+      int n=arg.toInt();
+      if (n<0) n=0;
+      if (n>1000) n=1000;
+      serialCmdActive=true;
+      serialCmdTemp=n; serialCmdTempValid=true;
+      Serial.println(String("CMD:SETTEMP ")+String(n)+" OK");
+    }
+  }
+  else if (cmd=="MODE")
+  {
+    int n=arg.toInt();
+    if ((serialArgIsNumber(arg))&&(n>=0)&&(n<=6))
+    {
+      engineMode=n;
+      startStage=startStage0;
+      Serial.println(String("CMD:MODE ")+String(n)+" OK");
+    }
+    else Serial.println("CMD:MODE ERR");
+  }
+  else if (cmd=="ABORT")
+  {
+    AbortAll();
+    Serial.println("CMD:ABORT OK");
+  }
+  else if (cmd=="RESET")
+  {
+    errorCode=0;
+    engineMode=modeWaiting;
+    startStage=startStage0;
+    Serial.println("CMD:RESET OK");
+  }
+  else if ((cmd=="RC")||(cmd=="REMOTE"))
+  {
+    serialCmdActive=false;
+    serialCmdThrottleValid=false;
+    serialCmdModeValid=false;
+    serialCmdRPMValid=false;
+    serialCmdTempValid=false;
+    Serial.println("CMD:RC OK");
+  }
+  else if (cmd=="PING")
+  {
+    Serial.println("CMD:PING OK");
+  }
+  else if (cmd=="HELP")
+  {
+    Serial.println("CMD:START|STOP|THROTTLE n|MODE n|SETRPM n|SETTEMP n|ABORT|RESET|RC|PING|HELP");
+  }
+  else Serial.println("CMD:UNKNOWN "+cmdLine);
+}
+
+//Apply serial GUI override of RC inputs and simulated sensors when active
+void ApplySerialOverride()
+{
+  if (serialCmdActive)
+  {
+    //Watchdog: if no serial traffic arrives for serialCmdTimeout ms the GUI
+    //is assumed dead or disconnected, so revert to physical RC/switch control.
+    if ((millis()-serialCmdLastMillis)>serialCmdTimeout)
+    {
+      serialCmdActive=false;
+      serialCmdThrottleValid=false;
+      serialCmdModeValid=false;
+      serialCmdRPMValid=false;
+      serialCmdTempValid=false;
+      return;
+    }
+  }
+  if (!serialCmdActive) return;
+  switchControlActive=true;//suppress RC-signal-lost fault while serial override is active
+  if (serialCmdThrottleValid) rcThrottleSignal=serialCmdThrottle;
+  if (serialCmdModeValid) rcModeSignal=serialCmdMode;
+  if (serialCmdRPMValid) RPMAvg=serialCmdRPM;
+  if (serialCmdTempValid) exTemp=serialCmdTemp;
+}
+
+//One line of compact JSON telemetry, sent once per second
+void SendSerialTelemetry()
+{
+  if ((millis()-telemetryLoopTimeOld)<telemetryLoopTime) return;
+  telemetryLoopTimeOld=millis();
+
+  const char* stage;
+  if (engineMode==modeStarting) stage=(startStage==startStage0)?"purge":"ramp";
+  else if (engineMode==modeIdling) stage="idle";
+  else if (engineMode==modeOperating) stage="op";
+  else if (engineMode==modeCooldown) stage="cool";
+  else if (engineMode==modeStarterOnly) stage="t-st";
+  else if (engineMode==modeFuelPumpOnly) stage="t-fuel";
+  else stage="wait";
+
+  Serial.print("{\"t\":");
+  Serial.print(millis());
+  Serial.print(",\"mode\":");
+  Serial.print(engineMode);
+  Serial.print(",\"stage\":\"");
+  Serial.print(stage);
+  Serial.print("\",\"thr\":");
+  Serial.print(rcThrottleSignal);
+  Serial.print(",\"modesig\":");
+  Serial.print(rcModeSignal);
+  Serial.print(",\"rpm\":");
+  Serial.print(RPMAvg);
+  Serial.print(",\"temp\":");
+  Serial.print(exTemp);
+  Serial.print(",\"volt\":");
+  {
+    float voltOut=voltage;
+    if ((isnan(voltOut))||(voltOut<0)) voltOut=0;//keep JSON valid if the ADC reading is garbage
+    if (voltOut>100) voltOut=100;
+    Serial.print(voltOut,1);
+  }
+  Serial.print(",\"fuel\":");
+  Serial.print(fuelFlowNow);
+  Serial.print(",\"starter\":");
+  Serial.print(startMotorNow);
+  Serial.print(",\"glow\":");
+  Serial.print(glowPower);
+  Serial.print(",\"gas\":");
+  Serial.print(gasFlow?1:0);
+  Serial.print(",\"fuelv\":");
+  Serial.print(fuelFlow?1:0);
+  Serial.print(",\"err\":");
+  Serial.print(errorCode);
+  Serial.print(",\"loop\":");
+  Serial.print(measuredLoopTime);
+  Serial.println("}");
+}
+
 void loop(void) {
   
  if((startServer)&&(!serverStarted)&&(millis()>5000))//5 seconds before WiFi startup is given to allow power to stabilize
@@ -599,7 +861,10 @@ void loop(void) {
   ReadRPM();
   ReadTempSensors(); //100ms loop time
   ReadVoltage();
+  ApplySerialOverride();//serial GUI override of RC inputs and simulated sensors (if active)
   UpdateDisplay(); //LCD refresh once per second
+  ProcessSerialCommands();//parse GUI commands from serial
+  SendSerialTelemetry();//one line of JSON telemetry per second
 
 //  if (errorCode==0)
 // {
@@ -761,22 +1026,65 @@ void ReadRC()//values are updated in ISR and this function processes the result
 //saving previous values
 unsigned long rcThrottleSignalold=rcThrottleSignal;
 unsigned long rcModeSignalold=rcModeSignal;
-rcThrottleSignal=RCThrottlemicros;
-if((rcThrottleSignal<1000)) rcThrottleSignal=1000;
-rcThrottleSignal=(rcThrottleSignal-1000)/10;//RC signal in %
-//removing signal glithes bigger than 30
-if (rcThrottleSignal>(rcThrottleSignalold+30))rcThrottleSignal=rcThrottleSignalold+30;
-if ((rcThrottleSignalold>30)&&(rcThrottleSignal<(rcThrottleSignalold-30)))rcThrottleSignal=rcThrottleSignalold-30;
 
-rcModeSignal=RCModemicros;
-if((rcModeSignal<1000)||(rcModeSignal>2300)) rcModeSignal=1000;
-rcModeSignal=(rcModeSignal-1000)/10;//RC signal in %
+//Read engine control switch (IO10). HIGH = switch+pot control, LOW = RC control.
+//Debounced: a level change is accepted only after 3 consecutive stable reads (~60ms).
+bool rawSwitch=digitalRead(EngineSwitch_Pin);
+if (rawSwitch==engineSwitchOn) switchStableCount=0;//stable, reset debounce counter
+else
+{
+  switchStableCount++;
+  if (switchStableCount>=3)
+  {
+    engineSwitchPrev=engineSwitchOn;
+    engineSwitchOn=rawSwitch;
+    switchStableCount=0;
+  }
+}
 
-//removing signal glithes bigger than 30
-if (rcModeSignal>(rcModeSignalold+30))rcModeSignal=rcModeSignalold+30;
-if ((rcModeSignalold>30)&&(rcModeSignal<(rcModeSignalold-30)))rcModeSignal=rcModeSignalold-30;
+if (engineSwitchOn)//switch pulled high: use switch + potentiometer for control
+{
+  switchControlActive=true;//engine is under switch+pot control, so ignore RC signal lost fault
+  //Potentiometer (IO9) outputs 0-100 throttle, 0=idle, 100=maxRPM
+  throttlePotValue=map(analogRead(ThrottlePot_Pin),0,4095,0,100);
+  if (throttlePotValue>100) throttlePotValue=100;
+  if (throttlePotValue<0) throttlePotValue=0;
+  rcThrottleSignal=throttlePotValue;
+  rcModeSignal=100;//force mode switch on so engine stays running
+  //Re-arm restart safety when the pot is deliberately moved away from idle and back
+  if (throttlePotValue>10) potMovedAfterAbort=true;
+  else if ((potMovedAfterAbort)&&(throttlePotValue<10))
+  {
+    switchRestartArmed=true;
+    potMovedAfterAbort=false;
+  }
+}
+else//switch pulled low: use original RC input logic
+{
+  switchRestartArmed=true;//re-cycling the switch re-arms restart after an abort
+  if (engineSwitchPrev)//one-shot falling edge: switch was high and user pulled it low
+  {
+    engineSwitchPrev=false;//consume the edge so it doesn't re-trigger
+    if ((engineMode==modeStarting)||(engineMode==modeIdling)||(engineMode==modeOperating)) engineMode=modeCooldown;
+  }
+  if ((engineMode==modeWaiting)&&(!ignitionState)) switchControlActive=false;//back to RC control only when engine is cool
+  rcThrottleSignal=RCThrottlemicros;
+  if((rcThrottleSignal<1000)) rcThrottleSignal=1000;
+  rcThrottleSignal=(rcThrottleSignal-1000)/10;//RC signal in %
+  //removing signal glithes bigger than 30
+  if (rcThrottleSignal>(rcThrottleSignalold+30))rcThrottleSignal=rcThrottleSignalold+30;
+  if ((rcThrottleSignalold>30)&&(rcThrottleSignal<(rcThrottleSignalold-30)))rcThrottleSignal=rcThrottleSignalold-30;
+
+  rcModeSignal=RCModemicros;
+  if((rcModeSignal<1000)||(rcModeSignal>2300)) rcModeSignal=1000;
+  rcModeSignal=(rcModeSignal-1000)/10;//RC signal in %
+
+  //removing signal glithes bigger than 30
+  if (rcModeSignal>(rcModeSignalold+30))rcModeSignal=rcModeSignalold+30;
+  if ((rcModeSignalold>30)&&(rcModeSignal<(rcModeSignalold-30)))rcModeSignal=rcModeSignalold-30;
+}
 RCLoopTimeOld=millis();
- 
+  
   }
 }
 
@@ -1016,9 +1324,16 @@ void WaitingFunction()
 {
 if (errorCode>0)
 {
-  delay(3000);
-  errorCode=0; //reset error code
+  //Non-blocking error auto-reset: hold the fault for 3 s, then clear it,
+  //without freezing the loop (telemetry and serial commands keep running).
+  if (errorResetTime==0) errorResetTime=millis();
+  if ((millis()-errorResetTime)>=3000)
+  {
+    errorCode=0; //reset error code
+    errorResetTime=0;
+  }
 }
+else errorResetTime=0;
  
   startStageTimeOld=0;
   gasOnTime=0;
@@ -1031,15 +1346,22 @@ if (errorCode>0)
 else fuelFlowTarget=map(rcThrottleSignal,0,100,outMin,outMax);        //follow throttle control
 if ((rcModeSignal>80)&&(rcThrottleSignal<10)&&(exTemp<ignitionThreshold))//Start only when throttle is below 10%
 {
-  pumpPrime=false;//reset throttle control at startup to starter control
-  engineMode=modeStarting;
-  startStage=startStage0;
+  if ((!engineSwitchOn)||(switchRestartArmed))//switch control must be re-armed after an abort; RC starts normally
+  {
+    pumpPrime=false;//reset throttle control at startup to starter control
+    engineMode=modeStarting;
+    startStage=startStage0;
+  }
 }
 
 }
 void StartingFunction()
 {
-  if (rcModeSignal<20) AbortAll();
+  if (rcModeSignal<20)
+  {
+    if (switchControlActive) engineMode=modeCooldown;//switch pulled low during switch control: cool down
+    else AbortAll();//original RC logic: abort
+  }
   else
   {
  
@@ -1199,7 +1521,11 @@ if (RPMAvg>(idleRPM+3000)) engineMode=modeOperating;
 }
 void OperatingFunction(){
 
-if (rcModeSignal<20) AbortAll();
+if (rcModeSignal<20)
+{
+  if (switchControlActive) engineMode=modeCooldown;//switch pulled low during switch control: cool down
+  else AbortAll();//original RC logic: abort
+}
 else
 {
 int targetRPM=idleRPM+ int(round(((maxRPM-idleRPM)*rcThrottleSignal)/100));
@@ -1257,8 +1583,9 @@ else{
  }
   else bitClear(errorCode,2);
 
-   //if no RC Signal within RCSignalMaxTime
- if ((millis()>RCSignalmillis)&&((millis()-RCSignalmillis)>RCSignalMaxTime) )
+   //if no RC Signal within RCSignalMaxTime. Ignored when switch+pot control is active (no RC receiver used)
+ if (switchControlActive) bitClear(errorCode,3);
+ else if ((millis()>RCSignalmillis)&&((millis()-RCSignalmillis)>RCSignalMaxTime) )
  {
   if (ignitionState){
      //1 = no Ignition,2=max temp exceeded,4=max RPM exceeded, 8=no RC signal,16=Flameout,32=RPM , 64= No Fuel Failure,128=Unable to reach Idle RPM with full motor power//use by setting and reading bits
@@ -1337,6 +1664,8 @@ void AbortAll()
 
   engineMode=modeWaiting;
   startStage=startStage0;
+  switchRestartArmed=false;//switch control must be re-cycled (or pot moved) before restarting after an abort
+  potMovedAfterAbort=false;//pot must be moved away from idle and back to re-arm restart
   
   fuelServo.write(MIN_MICROS);
   startServo.write(MIN_MICROS);
@@ -2425,10 +2754,12 @@ if ((millis()-engineUsageTimeOld)>saveUsageTime)
  if(!result) {
     Serial.println("LittleFS Mount Failed");
     fsavailable=false;
+    fsAvailableFlag=false;
   } else 
   {
     Serial.println("LittleFS Mount Success");
     fsavailable=true;
+    fsAvailableFlag=true;
   }
   
   // Ensure the directory exists if needed for LittleFS
