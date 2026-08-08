@@ -121,6 +121,7 @@ the firmware's [Serial Interface](#serial-interface) instead of a web browser.
 Features:
 * Aviation-style dial gauges - RPM (0-120000, yellow arc 100000-110000, red arc 110000-120000) and EGT (0-1100 C, yellow arc 630-750, red arc 750-1100)
 * START / STOP / ABORT / RESET / RC / PING buttons, MODE 0-6 selector and Throttle 0-100 slider
+* Engine run time display (cumulative minutes, persisted on the ECU)
 * Gas and fuel solenoid valve indicators
 * CSV + JSONL data logging of every telemetry reading, with buttons to open the log files
 * Light / Dark theme toggle and keyboard throttle control (W/S = +-1 %, X = cut to 0)
@@ -137,7 +138,7 @@ The ECU Rev 11 firmware exposes telemetry and control over the USB serial port (
 so the PC GUI and any custom client can monitor and drive the engine without the web interface.
 
 * Telemetry - one compact JSON line per second:
-  `{"t":<ms>,"mode":n,"stage":"purge|ramp|idle|op|cool|t-st|t-fuel|wait","thr":n,"modesig":n,"rpm":n,"temp":n,"volt":f,"fuel":n,"starter":n,"glow":n,"gas":0/1,"fuelv":0/1,"err":n,"loop":n}`
+  `{"t":<ms>,"mode":n,"stage":"purge|ramp|idle|op|cool|t-st|t-fuel|wait","thr":n,"modesig":n,"rpm":n,"temp":n,"volt":f,"fuel":n,"starter":n,"glow":n,"gas":0/1,"fuelv":0/1,"err":n,"run":n,"loop":n}` (`run` = cumulative engine run time in minutes, persisted in the ECU's NVS)
 * Commands (case-insensitive): `START | STOP | THROTTLE <0-100> | MODE <0-6> | SETRPM <0-100000> | SETTEMP <0-1000> | ABORT | RESET | RC | PING | HELP`, each acknowledged with `CMD:<CMD> OK` / `CMD:<CMD> ERR` / `CMD:UNKNOWN ...`
 * While a serial override is active, throttle, mode, RPM and EGT are driven by the GUI instead of the RC/switch inputs
 
@@ -186,6 +187,7 @@ Software corrections-DynamicJsonDoc moved from global to local- Removed OLED Dis
 * Serial override watchdog - if no serial traffic arrives within 5 s (`serialCmdTimeout`) the ECU automatically reverts to physical RC/switch control
 * Non-blocking error auto-reset - the 3 s error hold in WaitingFunction no longer blocks the loop, so telemetry and serial commands keep running during a fault
 * JSON-safe telemetry - battery voltage is clamped and formatted so a bad ADC reading cannot break the JSON telemetry line
+* Engine run time counter - cumulative minutes while the ignition is lit, persisted in NVS across power cycles and included in the serial telemetry (`run`) and web usage page
 * LittleFS write guard - file appends are skipped (with a one-time warning) when the filesystem is not mounted, instead of logging errors every control-loop pass
 
 

@@ -53,6 +53,7 @@ watchdog (5 s, `serialCmdTimeout`) never disengages, even when no setting is bei
 * **RPM dial** - 0-120000, yellow arc 100000-110000, red arc 110000-120000 (ticks in thousands)
 * **EGT dial** - 0-1100 C, yellow arc 630-750, red arc 750-1100
 * **Throttle / Voltage** progress bars
+* **Run Time** - cumulative engine run time in minutes (persisted in the ECU's NVS; increments while the ignition is lit)
 * **Valve icons** for the gas and fuel solenoids (from the `gas` / `fuelv` telemetry fields)
 * **Event log** with the CSV / JSONL file paths and `Open CSV` / `Open JSONL` / `Open folder` buttons
 * **Light / Dark** theme toggle (top-left)
@@ -62,7 +63,7 @@ watchdog (5 s, `serialCmdTimeout`) never disengages, even when no setting is bei
 The firmware sends one compact JSON line per second, e.g.:
 
 ```json
-{"t":12345,"mode":3,"stage":"op","thr":50,"modesig":50,"rpm":42000,"temp":610,"volt":24.3,"fuel":0,"starter":0,"glow":0,"gas":1,"fuelv":1,"err":0,"loop":2}
+{"t":12345,"mode":3,"stage":"op","thr":50,"modesig":50,"rpm":42000,"temp":610,"volt":24.3,"run":87,"fuel":0,"starter":0,"glow":0,"gas":1,"fuelv":1,"err":0,"loop":2}
 ```
 
 Commands are case-insensitive: `START | STOP | THROTTLE <0-100> | MODE <0-6> | SETRPM <0-100000> |
@@ -72,5 +73,5 @@ SETTEMP <0-1000> | ABORT | RESET | RC | PING | HELP`; each is acknowledged with
 
 ## Logs
 
-Each run regenerates `engine_log.csv` (one row per telemetry line) and `engine_log.jsonl`
+Each run regenerates `engine_log.csv` (one row per telemetry line, including the `run_min` column) and `engine_log.jsonl`
 (the raw JSON lines). The event-log panel header shows both paths with open buttons.
