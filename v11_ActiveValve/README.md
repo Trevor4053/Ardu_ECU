@@ -16,7 +16,7 @@ This fork adds a third regime:
 | Commanded flow | Pump | Fuel solenoid |
 | --- | --- | --- |
 | `fuelFlowTarget >= pumpOnValue` | normal proportional control | ON (continuous) |
-| `0 < fuelFlowTarget < pumpOnValue` | held at minimum setpoint | pulsed at 2 Hz |
+| `0 < fuelFlowTarget < pumpOnValue` | held at minimum setpoint | pulsed at up to 1 Hz |
 | `fuelFlowTarget == 0` | minimum setpoint | OFF |
 
 In the pulsed regime the solenoid duty cycle is
@@ -26,10 +26,10 @@ duty = fuelFlowTarget / pumpOnValue
 ```
 
 so the *average* fuel flow reaching the engine matches the commanded flow, down to a few
-percent of minimum. The pulse period is fixed at `activeValvePeriod = 500 ms` (2 Hz).
-1 Hz is the minimum allowed pulse frequency, i.e. the period never exceeds 1000 ms
-(`activeValvePeriod` is a `#define` at the top of `v11_ActiveValve.ino`; lower
-frequency = longer period, never below 1 Hz).
+percent of minimum. The pulse period is fixed at `activeValvePeriod = 1000 ms`. The
+solenoid never switches between on and off more than once per second, i.e. the maximum
+pulse frequency is 1 Hz (`activeValvePeriod` is a `#define` at the top of
+`v11_ActiveValve.ino`; a longer period is allowed, a shorter one is not).
 
 ### Notes
 
@@ -52,6 +52,6 @@ arduino-cli compile --fqbn esp32:esp32:esp32s3 "v11_ActiveValve"
 
 - `#define activeValvePeriod` + Active Valve globals (`activeValveActive`,
   `activeValveDuty`, `activeValveOn`, `activeValveTimeOld`)
-- `ActiveValveUpdate(duty)` - 2 Hz on/off pulse generator for the solenoid
+- `ActiveValveUpdate(duty)` - 1 Hz on/off pulse generator for the solenoid
 - `ControlOutput()` captures the true commanded flow before the slew/floor clamps and
   selects the pulsed regime when flow is below the pump minimum
