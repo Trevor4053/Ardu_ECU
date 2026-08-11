@@ -836,6 +836,8 @@ void SendSerialTelemetry()
   Serial.print(fuelFlow?1:0);
   Serial.print(",\"err\":");
   Serial.print(errorCode);
+  Serial.print(",\"run\":");
+  Serial.print(engineRunTime);
   Serial.print(",\"loop\":");
   Serial.print(measuredLoopTime);
   Serial.println("}");

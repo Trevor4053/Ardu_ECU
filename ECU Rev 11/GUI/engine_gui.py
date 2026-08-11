@@ -73,7 +73,7 @@ OUTPUT_MAX = 1000
 
 CSV_HEADER = [
     "wallclock", "t_ms", "mode", "mode_name", "stage",
-    "throttle", "modesig", "rpm", "temp", "volt",
+    "throttle", "modesig", "rpm", "temp", "volt", "run_min",
     "fuel", "starter", "glow", "gas", "fuelv", "err", "err_names", "loop_ms",
 ]
 
@@ -239,6 +239,7 @@ class Logger:
             tele.get("rpm", ""),
             tele.get("temp", ""),
             tele.get("volt", ""),
+            tele.get("run", ""),
             tele.get("fuel", ""),
             tele.get("starter", ""),
             tele.get("glow", ""),
@@ -517,6 +518,7 @@ class App:
             ("Mode", ""), ("Stage", ""), ("Error", ""),
             ("Fuel Pump", ""), ("Starter", ""), ("Glow Plug", ""),
             ("Gas Valve", ""), ("Fuel Valve", ""), ("Loop Time", ""),
+            ("Run Time", ""),
         ]
         for i, (name, _) in enumerate(rows):
             ttk.Label(s, text=name + ":").grid(row=i, column=0, sticky=tk.E, pady=1)
@@ -525,7 +527,7 @@ class App:
             self.state_vars[name] = v
 
         valve_bar = ttk.Frame(s)
-        valve_bar.grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(14, 0))
+        valve_bar.grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(14, 0))
         self.gas_valve = ValveIcon(valve_bar, "GAS SOLENOID")
         self.gas_valve.pack(side=tk.LEFT, padx=(0, 14))
         self.fuel_valve = ValveIcon(valve_bar, "FUEL SOLENOID")
@@ -812,6 +814,7 @@ class App:
         self.gas_valve.set_state(d.get("gas", 0))
         self.fuel_valve.set_state(d.get("fuelv", 0))
         self.state_vars["Loop Time"].set("%d ms" % d.get("loop", 0))
+        self.state_vars["Run Time"].set("%d min" % d.get("run", 0))
 
         self.rpm_gauge.set_value(d.get("rpm", 0))
         self.egt_gauge.set_value(d.get("temp", 0))
@@ -824,9 +827,9 @@ class App:
 
         uptime = d.get("t", 0) / 1000.0
         self._set_status(
-            "connected %ds  mode=%s  rpm=%s  temp=%s  err=%s  rows=%d" % (
+            "connected %ds  mode=%s  rpm=%s  temp=%s  err=%s  run=%s min  rows=%d" % (
                 int(uptime), MODES.get(mode, mode), d.get("rpm"), d.get("temp"),
-                err, self.logger.count))
+                err, d.get("run", 0), self.logger.count))
 
 
 def main():
@@ -883,11 +886,12 @@ def selftest():
             failures.append(name)
 
     good = ('{"t":1000,"mode":1,"stage":"ramp","thr":50,"modesig":100,'
-            '"rpm":9000,"temp":500,"volt":12.3,"fuel":1,"starter":1,'
+            '"rpm":9000,"temp":500,"volt":12.3,"run":87,"fuel":1,"starter":1,'
             '"glow":1,"gas":1,"fuelv":1,"err":0,"loop":12}')
     d = parse_telemetry(good)
     check("parse valid telemetry", d is not None and d["mode"] == 1
           and d["rpm"] == 9000 and d["stage"] == "ramp")
+    check("parse run time", d is not None and d.get("run") == 87)
     check("parse rejects non-json", parse_telemetry("not json {") is None)
     check("parse rejects missing keys", parse_telemetry('{"t":1,"mode":1}') is None)
     check("parse rejects empty", parse_telemetry("") is None)
@@ -909,6 +913,7 @@ def selftest():
             lines = [ln for ln in f.read().splitlines() if ln.strip()]
         check("csv header + 2 rows", len(rows) == 3 and rows[0] == CSV_HEADER)
         check("csv row content", rows[1][2] == "1" and rows[2][1] == "2000")
+        check("csv run_min", rows[1][10] == "87")
         check("jsonl 2 lines", len(lines) == 2 and json.loads(lines[1])["mode"] == 3)
         check("logger count", lg.count == 2)
 
