@@ -48,6 +48,26 @@ Same board and toolchain as stock Rev 11 (ESP32-S3, `esp32:esp32:esp32s3`):
 arduino-cli compile --fqbn esp32:esp32:esp32s3 "v11_ActiveValve"
 ```
 
+## Simulation (no hardware / no Wokwi)
+
+`active_valve_sim.py` models the fuel-path of `ControlOutput()` and the exact
+`ActiveValveUpdate()` logic from the firmware, so the valve behavior can be verified
+offline:
+
+```
+python active_valve_sim.py
+```
+
+It runs a commanded-flow scenario (pulsed below the pump minimum, fuel cut, then normal
+operation), checks that the solenoid never completes more than one on/off cycle per second,
+and verifies the delivered average flow matches the command (e.g. 80% duty -> 40 of a 50
+`pumpOnValue`). Outputs a console summary plus `sim_out/active_valve_sim.csv` and
+`sim_out/active_valve_sim.png` (requires `pyserial`-independent `matplotlib` and `numpy`).
+
+The sim also reproduces a real stock behavior worth knowing: if a low flow is commanded
+while the pump output is still high, the solenoid stays continuously ON during the pump's
+slew-limited decay and only starts pulsing once the clamped target falls below `pumpOnValue`.
+
 ## Differences from stock ECU_Rev11
 
 - `#define activeValvePeriod` + Active Valve globals (`activeValveActive`,
