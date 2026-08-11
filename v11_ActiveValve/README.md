@@ -19,6 +19,10 @@ This fork adds a third regime:
 | `0 < fuelFlowTarget < pumpOnValue` | held at minimum setpoint | pulsed at up to 1 Hz |
 | `fuelFlowTarget == 0` | minimum setpoint | OFF |
 
+(The `>=` boundary is deliberate: at exactly `pumpOnValue` the solenoid stays on - the
+stock `>` logic cut the fuel dead at that single point, which the idle governor hunted
+across.)
+
 In the pulsed regime the solenoid duty cycle is
 
 ```
@@ -35,10 +39,24 @@ pulse frequency is 1 Hz (`activeValvePeriod` is a `#define` at the top of
 
 - The pump still runs at its existing minimum floor (`pumpOnValue - 1`, unchanged from
   stock Rev 11), so pump handling is identical outside the pulsed regime.
+- Every entry into the pulsed regime starts with the solenoid **open** (the pulse phase
+  is re-initialized), so a momentary fuel cut followed by re-engagement can never leave
+  the valve closed for up to a second - no fuel-starvation gap.
 - While the solenoid is pulsed, the serial telemetry `fuelv` field reports the live
   solenoid state (`1` during the on-phase, `0` during the off-phase).
 - Pump-prime mode and the solenoid on/off logic are otherwise unchanged; the pulsed
   regime only engages when `!pumpPrime && pumpOnValue > outMin && 0 < target < pumpOnValue`.
+- **Sub-minimum flow works in the running modes too.** In stock, the idle/operating fuel
+  governor is a +/-1 integrator on `fuelFlowTarget` and `ControlOutput()` floored that
+  value at `pumpOnValue - 1`, so the flow could never be commanded below the pump
+  minimum (and at the exact floor the stock `>` solenoid logic cut the fuel). In this
+  fork the pump-minimum floor applies to the pump output only, the integrator is free to
+  command below `pumpOnValue`, and the solenoid duty carries the reduction. The
+  anti-runaway down-clamp and the pump deceleration branches are likewise floored at the
+  pump minimum so the pump output never waggles in the pulsed regime.
+- The idle/operating "hold" path no longer snaps `fuelFlowTarget` to `fuelFlowNow`
+  (snapping would pin the target to the pump floor and defeat the pulsing); it now
+  simply holds the current target.
 
 ## Build
 
@@ -64,6 +82,11 @@ and verifies the delivered average flow matches the command (e.g. 80% duty -> 40
 `pumpOnValue`). Outputs a console summary plus `sim_out/active_valve_sim.csv` and
 `sim_out/active_valve_sim.png` (requires `pyserial`-independent `matplotlib` and `numpy`).
 
+The sim also checks the re-engagement transition (valve must open immediately) and the
+idle-governor walk-down: emulating the +/-1 integrator of `IdlingFunction`/`OperatingFunction`,
+the target and pulse duty must be able to fall below `pumpOnValue` while the pump stays at
+its floor. Both checks fail against the pre-fix logic and pass now.
+
 The sim also reproduces a real stock behavior worth knowing: if a low flow is commanded
 while the pump output is still high, the solenoid stays continuously ON during the pump's
 slew-limited decay and only starts pulsing once the clamped target falls below `pumpOnValue`.
@@ -74,4 +97,11 @@ slew-limited decay and only starts pulsing once the clamped target falls below `
   `activeValveDuty`, `activeValveOn`, `activeValveTimeOld`)
 - `ActiveValveUpdate(duty)` - 1 Hz on/off pulse generator for the solenoid
 - `ControlOutput()` captures the true commanded flow before the slew/floor clamps and
-  selects the pulsed regime when flow is below the pump minimum
+  selects the pulsed regime when flow is below the pump minimum; the pump-minimum floor
+  and the anti-runaway down-clamp apply to the pump output only, and the continuous
+  solenoid branch uses `>= pumpOnValue` (no dead-zone fuel cut)
+- `IdlingFunction()` / `OperatingFunction()` hold the fuel target instead of snapping it
+  to the pump output, so the governor can command below the pump minimum
+- Cross-core logging safety: the LittleFS header is written by the core-0 logging task
+  and error messages are passed core 1 -> core 0 as `volatile` flags (`sysMsgPending` /
+  `sysMsgErrCode`) instead of a `String` shared between the two cores

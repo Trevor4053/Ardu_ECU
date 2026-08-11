@@ -52,27 +52,36 @@ def ActiveValveUpdate(duty, now):
     return activeValveOn
 
 
-def ControlOutput(desired, now):
-    """Fuel-path portion of ControlOutput() from v11_ActiveValve.ino."""
-    global fuelFlowTarget, fuelFlowNow, fuelFlow
-    global activeValveActive, activeValveDuty
+def ControlOutput(desired=None, now=0):
+    """Fuel-path portion of ControlOutput() from v11_ActiveValve.ino.
 
-    fuelFlowTarget = desired  # control logic writes the commanded target each loop
+    desired is the fresh command written by the control logic each loop
+    (WaitingFunction throttle map). Pass desired=None to emulate the
+    idle/operating +/-1 integrator, where the persistent fuelFlowTarget
+    carries over between ControlOutput() calls.
+    """
+    global fuelFlowTarget, fuelFlowNow, fuelFlow
+    global activeValveActive, activeValveDuty, activeValveOn, activeValveTimeOld
+
+    if desired is not None:
+        fuelFlowTarget = desired  # control logic writes the commanded target each loop
     valveDesiredFlow = fuelFlowTarget  # captured before slew/floor clamps modify it
 
     # Check Limits and stop runaway increment or decrement condition
     if fuelFlowTarget > OUT_MIN:
         if fuelFlowTarget > (fuelFlowNow + 1):
             fuelFlowTarget = fuelFlowNow + 1
-        if fuelFlowTarget < (fuelFlowNow - 1):
+        # down-clamp only while the pump is above its minimum: below the minimum
+        # the pulse duty carries the reduction, so the target may fall freely
+        if (fuelFlowNow > PUM_P_ON) and (fuelFlowTarget < (fuelFlowNow - 1)):
             fuelFlowTarget = fuelFlowNow - 1
 
     if fuelFlowTarget > OUT_MAX:
         fuelFlowTarget = OUT_MAX
 
     if PUM_P_ON > OUT_MIN:
-        if fuelFlowTarget < PUM_P_ON:
-            fuelFlowTarget = PUM_P_ON - 1
+        # pump minimum floor applies to the pump OUTPUT only; the commanded
+        # value stays free below it so the valve duty can deliver low flow
         if fuelFlowNow < PUM_P_ON:
             fuelFlowNow = PUM_P_ON - 1
     elif fuelFlowTarget < OUT_MIN:
@@ -81,6 +90,10 @@ def ControlOutput(desired, now):
     # Active Valve: commanded flow below pump minimum -> pulse the solenoid
     if (not PUMP_PRIME) and (PUM_P_ON > OUT_MIN) and (valveDesiredFlow < PUM_P_ON):
         if valveDesiredFlow > OUT_MIN:
+            # start pulsing with the valve open (mirrors firmware fix)
+            if not activeValveActive:
+                activeValveOn = True
+                activeValveTimeOld = now
             activeValveActive = True
             activeValveDuty = float(valveDesiredFlow) / float(PUM_P_ON)
             if activeValveDuty < 0.0:
@@ -95,7 +108,7 @@ def ControlOutput(desired, now):
         activeValveDuty = 0.0
 
     # Fuel Flow Solenoid control
-    if (not PUMP_PRIME) and (PUM_P_ON > OUT_MIN) and (fuelFlowTarget > PUM_P_ON):
+    if (not PUMP_PRIME) and (PUM_P_ON > OUT_MIN) and (fuelFlowTarget >= PUM_P_ON):
         fuelFlow = True
     elif (not PUMP_PRIME) and (PUM_P_ON == OUT_MIN) and (fuelFlowTarget > OUT_MIN):
         fuelFlow = True
@@ -104,11 +117,14 @@ def ControlOutput(desired, now):
     else:
         fuelFlow = False
 
-    # pump output ramp (simplified: 1 unit per control step)
+    # pump output ramp (simplified: 1 unit per control step, floored at the
+    # pump minimum like the firmware's deceleration branches)
     if fuelFlowNow < fuelFlowTarget:
         fuelFlowNow += 1
     elif fuelFlowNow > fuelFlowTarget:
         fuelFlowNow -= 1
+        if fuelFlowNow < PUM_P_ON - 1:
+            fuelFlowNow = PUM_P_ON - 1
 
 
 def profile(t):
@@ -122,6 +138,93 @@ def profile(t):
     if t < 16000:
         return 500           # normal flow -> solenoid continuous ON
     return 1000              # high operating flow -> continuous ON
+
+
+def transition_check():
+    """Re-engagement after a fuel cut must open the valve immediately.
+
+    With a stale pulse phase, re-entering the pulsed regime could hold the valve
+    closed for up to one full second (fuel starvation on rapid throttle dips).
+    The firmware fix starts each pulse regime with the valve OPEN.
+    """
+    global fuelFlowTarget, fuelFlowNow, fuelFlow
+    global activeValveActive, activeValveDuty, activeValveOn, activeValveTimeOld
+
+    fuelFlowTarget = fuelFlowNow = 0
+    fuelFlow = False
+    activeValveActive = False
+    activeValveDuty = 0.0
+    activeValveOn = False
+    activeValveTimeOld = 0
+
+    # engage at boot; brief 150 ms cut at t=750 (mid pulse phase); re-engage at 900.
+    # Without the firmware fix, a stale pulse phase holds the valve closed through
+    # the re-engagement (starvation window up to 1 s).
+    profile = [(0, 750, 25), (750, 900, 0), (900, 3000, 25)]
+    eng = {}       # engage time -> valve state at that instant
+    first_off = {} # engage time -> time of first OFF after engagement
+    prev = None
+    for t in range(0, 3000, DT):
+        desired = next(v for (t0, t1, v) in profile if t0 <= t < t1)
+        was_active = activeValveActive
+        ControlOutput(desired, t)
+        if activeValveActive and not was_active:
+            eng[t] = fuelFlow          # valve state at the engage step
+            first_off[t] = None
+        for e in eng:
+            if first_off[e] is None and prev is True and fuelFlow is False and e < t:
+                first_off[e] = t
+        prev = fuelFlow
+
+    ok = True
+    for e in sorted(eng):
+        if eng[e] is not True:
+            ok = False
+        print(f"  engage at t={e} ms: valve={'ON' if eng[e] else 'OFF'}"
+              f"  first OFF={first_off[e]}")
+    open_ok = all(v is True for v in eng.values())
+    print(f"transition: {'PASS - valve opens immediately on (re)engagement' if open_ok else 'FAIL - valve started closed'}")
+    return open_ok
+
+
+def idle_governor_check():
+    """Idle/operating fuel control is a +/-1 integrator on the persistent
+    fuelFlowTarget (IdlingFunction/OperatingFunction do ++/-- per loop).
+
+    Regression: the slew down-clamp and the pump floor used to pin the target
+    at pumpOnValue-1, so sub-minimum active-valve flow was unreachable in
+    running modes (duty stuck at ~98%). Now the target (and pulse duty) can
+    walk down to the commanded low flow while the pump stays at its floor.
+    """
+    global fuelFlowTarget, fuelFlowNow, fuelFlow
+    global activeValveActive, activeValveDuty, activeValveOn, activeValveTimeOld
+
+    fuelFlowTarget = PUM_P_ON        # settled at the pump minimum boundary
+    fuelFlowNow = PUM_P_ON - 1       # pump at its floor
+    fuelFlow = False
+    activeValveActive = False
+    activeValveDuty = 0.0
+    activeValveOn = False
+    activeValveTimeOld = 0
+
+    # mimic IdlingFunction: RPM above target -> fuelFlowTarget-- each loop,
+    # no fresh command (desired=None keeps the persistent target)
+    for i in range(35):   # 50 -> 15, well into the pulsed regime
+        fuelFlowTarget -= 1
+        ControlOutput(None, i * DT)
+
+    ok = True
+    if fuelFlowTarget != 15:
+        ok = False
+        print(f"  target pinned by slew/floor at {fuelFlowTarget} (expected 15)")
+    if not activeValveActive or abs(activeValveDuty - 15.0 / PUM_P_ON) > 1e-6:
+        ok = False
+        print(f"  duty = {activeValveDuty:.3f} (expected {15.0 / PUM_P_ON:.3f})")
+    if fuelFlowNow != PUM_P_ON - 1:
+        ok = False
+        print(f"  pump output = {fuelFlowNow} (expected floor {PUM_P_ON - 1})")
+    print(f"governor low-flow: {'PASS - target/duty reach sub-minimum flow in running modes' if ok else 'FAIL'}")
+    return ok
 
 
 def main():
@@ -193,6 +296,10 @@ def main():
           f" (desired 25)")
     print(f"compliance: {'PASS' if max_per_window <= 2 else 'FAIL'}"
           f" max one on/off cycle per second")
+    print()
+    transition_check()
+    print()
+    idle_governor_check()
     print("note: if a low flow is commanded while the pump output is still high, the")
     print("      solenoid stays continuous ON during the pump's slew-limited decay,")
     print("      then switches to pulsing once the clamped target falls below pumpOnValue")
@@ -211,3 +318,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
