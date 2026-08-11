@@ -1744,6 +1744,10 @@ void ControlOutput()
    {
      if (valveDesiredFlow>outMin)
      {
+       //Start pulsing with the valve open so the transition into the pulsed regime
+       //never closes the fuel supply (a stale pulse phase could hold the valve
+       //closed for up to one full second otherwise).
+       if (!activeValveActive) { activeValveOn=true; activeValveTimeOld=millis(); }
        activeValveActive=true;
        activeValveDuty=float(valveDesiredFlow)/float(pumpOnValue);
        if (activeValveDuty<0.0f) activeValveDuty=0.0f;

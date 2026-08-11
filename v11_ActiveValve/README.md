@@ -35,6 +35,9 @@ pulse frequency is 1 Hz (`activeValvePeriod` is a `#define` at the top of
 
 - The pump still runs at its existing minimum floor (`pumpOnValue - 1`, unchanged from
   stock Rev 11), so pump handling is identical outside the pulsed regime.
+- Every entry into the pulsed regime starts with the solenoid **open** (the pulse phase
+  is re-initialized), so a momentary fuel cut followed by re-engagement can never leave
+  the valve closed for up to a second - no fuel-starvation gap.
 - While the solenoid is pulsed, the serial telemetry `fuelv` field reports the live
   solenoid state (`1` during the on-phase, `0` during the off-phase).
 - Pump-prime mode and the solenoid on/off logic are otherwise unchanged; the pulsed

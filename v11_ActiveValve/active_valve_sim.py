@@ -55,7 +55,7 @@ def ActiveValveUpdate(duty, now):
 def ControlOutput(desired, now):
     """Fuel-path portion of ControlOutput() from v11_ActiveValve.ino."""
     global fuelFlowTarget, fuelFlowNow, fuelFlow
-    global activeValveActive, activeValveDuty
+    global activeValveActive, activeValveDuty, activeValveOn, activeValveTimeOld
 
     fuelFlowTarget = desired  # control logic writes the commanded target each loop
     valveDesiredFlow = fuelFlowTarget  # captured before slew/floor clamps modify it
@@ -81,6 +81,10 @@ def ControlOutput(desired, now):
     # Active Valve: commanded flow below pump minimum -> pulse the solenoid
     if (not PUMP_PRIME) and (PUM_P_ON > OUT_MIN) and (valveDesiredFlow < PUM_P_ON):
         if valveDesiredFlow > OUT_MIN:
+            # start pulsing with the valve open (mirrors firmware fix)
+            if not activeValveActive:
+                activeValveOn = True
+                activeValveTimeOld = now
             activeValveActive = True
             activeValveDuty = float(valveDesiredFlow) / float(PUM_P_ON)
             if activeValveDuty < 0.0:
@@ -122,6 +126,53 @@ def profile(t):
     if t < 16000:
         return 500           # normal flow -> solenoid continuous ON
     return 1000              # high operating flow -> continuous ON
+
+
+def transition_check():
+    """Re-engagement after a fuel cut must open the valve immediately.
+
+    With a stale pulse phase, re-entering the pulsed regime could hold the valve
+    closed for up to one full second (fuel starvation on rapid throttle dips).
+    The firmware fix starts each pulse regime with the valve OPEN.
+    """
+    global fuelFlowTarget, fuelFlowNow, fuelFlow
+    global activeValveActive, activeValveDuty, activeValveOn, activeValveTimeOld
+
+    fuelFlowTarget = fuelFlowNow = 0
+    fuelFlow = False
+    activeValveActive = False
+    activeValveDuty = 0.0
+    activeValveOn = False
+    activeValveTimeOld = 0
+
+    # engage at boot; brief 150 ms cut at t=750 (mid pulse phase); re-engage at 900.
+    # Without the firmware fix, a stale pulse phase holds the valve closed through
+    # the re-engagement (starvation window up to 1 s).
+    profile = [(0, 750, 25), (750, 900, 0), (900, 3000, 25)]
+    eng = {}       # engage time -> valve state at that instant
+    first_off = {} # engage time -> time of first OFF after engagement
+    prev = None
+    for t in range(0, 3000, DT):
+        desired = next(v for (t0, t1, v) in profile if t0 <= t < t1)
+        was_active = activeValveActive
+        ControlOutput(desired, t)
+        if activeValveActive and not was_active:
+            eng[t] = fuelFlow          # valve state at the engage step
+            first_off[t] = None
+        for e in eng:
+            if first_off[e] is None and prev is True and fuelFlow is False and e < t:
+                first_off[e] = t
+        prev = fuelFlow
+
+    ok = True
+    for e in sorted(eng):
+        if eng[e] is not True:
+            ok = False
+        print(f"  engage at t={e} ms: valve={'ON' if eng[e] else 'OFF'}"
+              f"  first OFF={first_off[e]}")
+    open_ok = all(v is True for v in eng.values())
+    print(f"transition: {'PASS - valve opens immediately on (re)engagement' if open_ok else 'FAIL - valve started closed'}")
+    return open_ok
 
 
 def main():
@@ -193,6 +244,8 @@ def main():
           f" (desired 25)")
     print(f"compliance: {'PASS' if max_per_window <= 2 else 'FAIL'}"
           f" max one on/off cycle per second")
+    print()
+    transition_check()
     print("note: if a low flow is commanded while the pump output is still high, the")
     print("      solenoid stays continuous ON during the pump's slew-limited decay,")
     print("      then switches to pulsing once the clamped target falls below pumpOnValue")
@@ -211,3 +264,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
