@@ -253,7 +253,6 @@ int MAX_MICROS=      2450;
 int outMax=1000;
 int outMin=0;
 //output signal is identical to rc servo control signal and is generated using servo library
-Servo glowServo;
 Servo fuelServo;
 Servo startServo;
 
@@ -588,17 +587,16 @@ myMAX31855.begin();
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
 
-  glowServo.setPeriodHertz(50);// Standard 50hz servo
-  fuelServo.setPeriodHertz(50);// Standard 50hz servo
+    fuelServo.setPeriodHertz(50);// Standard 50hz servo
   startServo.setPeriodHertz(50);// Standard 50hz servo
   
-  glowServo.attach(GlowPin, MIN_MICROS, MAX_MICROS);  
   fuelServo.attach(FuelPumpPin, MIN_MICROS, MAX_MICROS);  
   startServo.attach(StarterPin, MIN_MICROS, MAX_MICROS);
   
   fuelServo.write(0);
   startServo.write(0);
-  glowServo.write(0); //0-180 
+  pinMode(GlowPin,OUTPUT);//glow plug driven as plain GPIO relay (no servo output)
+  digitalWrite(GlowPin,LOW);
   delay(3000);//let the servo signals stabilize
   
   ReadSettings();//read constants from EEPROM if available
@@ -1688,7 +1686,7 @@ void AbortAll()
   
   fuelServo.write(MIN_MICROS);
   startServo.write(MIN_MICROS);
-  glowServo.write(MIN_MICROS);
+  digitalWrite(GlowPin,LOW);//glow plug relay off
   digitalWrite(GasPin,LOW);
   digitalWrite(Fuel_Solenoid_Pin,LOW);
   gasOnTime=0;
@@ -1839,7 +1837,7 @@ if(startMotorTarget>starterTransition)
   startMotorTimeOld=millis();
   }
 
-  glowServo.write(map(glowPower,outMin,outMax,MIN_MICROS,MAX_MICROS)); 
+  digitalWrite(GlowPin,(glowPower>outMin)?HIGH:LOW);//glow plug relay: on whenever glowPower is above minimum 
  if(gasFlow) digitalWrite(GasPin,HIGH);
  else digitalWrite(GasPin,LOW);
  if(fuelFlow) digitalWrite(Fuel_Solenoid_Pin,HIGH);
