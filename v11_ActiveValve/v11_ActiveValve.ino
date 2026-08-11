@@ -102,8 +102,10 @@ String   webpage, MessageLine;
 bool dirpresent=false;//if default data directory is present or not
 bool fsavailable=false;
 bool writefile=true; //only write file if this variable is true
-String Data="";//Data string to be logged to Flash
-String sysMsg="";//system Message
+String Data="";//Data string to be logged to Flash (written on core 0 only - see Task1code)
+volatile bool headerPending=false;//header queued by core 1 (initLittleFS), written by core 0 (Task1code)
+volatile bool sysMsgPending=false;//error message queued by core 1 (AbortAll), formatted by core 0 (SaveData)
+volatile int sysMsgErrCode=0;//error code carried with the pending message
 
 //I2C 16x2 LCD display
 LiquidCrystal_I2C lcd(0x27, 16, 2);      //default PCF8574 address 0x27, 16 cols x 2 rows
@@ -924,7 +926,11 @@ void loop(void) {
 void Task1code( void * pvParameters ){
 //This function will run forever, like a second loop function
   for(;;){      
-   if(fsavailable && writefile)  SaveData();
+   if(fsavailable && writefile) 
+   {
+    if (headerPending) { SaveDataHeader(); headerPending=false; }//header written here (core 0) so both Data users run on one core
+    SaveData();
+   }
         vTaskDelay(10 / portTICK_PERIOD_MS);
   } 
 }
@@ -1525,7 +1531,9 @@ void IdlingFunction(){
 int targetRPM=idleRPM+ int(round(((maxRPM-idleRPM)*rcThrottleSignal)/100));
 if((RPMAvg<maxRPM)&&(RPMAvg<targetRPM)&&(exTemp<maxTemp)) fuelFlowTarget++;//only increase fuel flow if Average RPM< max RPM and exhaust temp<max Temp
 else if ((RPMAvg>(targetRPM+rpmTolerance))||(RPMAvg>maxRPM)||(exTemp>maxTemp)) fuelFlowTarget--;
-else fuelFlowTarget=fuelFlowNow;
+//else hold the current fuelFlowTarget - NOT snapped to fuelFlowNow, which is
+//floored at pumpOnValue-1; snapping pins the target to the pump minimum and
+//defeats sub-minimum active-valve pulsing in idle/operating
 if (RPMAvg>(idleRPM+3000)) engineMode=modeOperating;
 }
 }
@@ -1541,7 +1549,9 @@ else
 int targetRPM=idleRPM+ int(round(((maxRPM-idleRPM)*rcThrottleSignal)/100));
 if((RPMAvg<maxRPM)&&(RPMAvg<targetRPM)&&(exTemp<maxTemp)) fuelFlowTarget++;//only increase fuel flow if Average RPM< max RPM and exhaust temp<max Temp
 else if ((RPMAvg>(targetRPM+rpmTolerance))||(RPMAvg>maxRPM)||(exTemp>maxTemp)) fuelFlowTarget--;
-else fuelFlowTarget=fuelFlowNow;
+//else hold the current fuelFlowTarget - NOT snapped to fuelFlowNow, which is
+//floored at pumpOnValue-1; snapping pins the target to the pump minimum and
+//defeats sub-minimum active-valve pulsing in idle/operating
 if (RPMAvg<(idleRPM+3000)) engineMode=modeIdling;
 }
 }
@@ -1642,9 +1652,8 @@ if((engineMode==modeIdling)&&(RPMAvg<(starterOffRPM-5000)))//RPM incorrect as pe
 
 void AbortAll()
 { 
-  sysMsg+="Error Code, ";
-  sysMsg+=errorCode;
-  sysMsg+='\n'; 
+  sysMsgErrCode=errorCode;
+  sysMsgPending=true;//core 1 -> core 0 flag; SaveData formats the text (no cross-core String access)
   //take snapshot of critical data for analysis
   abRPMAvg=RPMAvg;
   abexTemp=exTemp;
@@ -1715,7 +1724,11 @@ void ControlOutput()
  if (fuelFlowTarget>outMin)
  {
   if (fuelFlowTarget>(fuelFlowNow+1)) fuelFlowTarget=fuelFlowNow+1;// never exceed more than One point
-  if (fuelFlowTarget<(fuelFlowNow-1)) fuelFlowTarget=fuelFlowNow-1;
+  //Anti-runaway down-clamp applies only while the pump is above its minimum:
+  //below the minimum the solenoid pulse duty carries the reduction, so the
+  //commanded value must be allowed to fall below pumpOnValue (otherwise it
+  //pins at pumpOnValue-1 and sub-minimum active-valve flow is unreachable).
+  if ((fuelFlowNow>pumpOnValue)&&(fuelFlowTarget<(fuelFlowNow-1))) fuelFlowTarget=fuelFlowNow-1;
  }
  if (startMotorTarget>outMin)
 {
@@ -1727,7 +1740,9 @@ void ControlOutput()
   
   if (pumpOnValue>outMin)
   {
-  if (fuelFlowTarget<pumpOnValue)  fuelFlowTarget=(pumpOnValue-1);
+  //Pump minimum floor applies to the pump OUTPUT only. The commanded value is
+  //left free to fall below pumpOnValue so Active Valve pulsing can deliver the
+  //lower average flow; the pump itself stays at its minimum in that regime.
  if (fuelFlowNow<pumpOnValue)  fuelFlowNow=(pumpOnValue-1);//required when system starts up as initially fuelFlowNow will be zero
    }
       else if (fuelFlowTarget<outMin) fuelFlowTarget=outMin;
@@ -1758,7 +1773,7 @@ void ControlOutput()
    else { activeValveActive=false; activeValveDuty=0.0f; }
   
    //Fuel Flow Solenoid control
-   if ((!pumpPrime)&&(pumpOnValue>outMin)&&(fuelFlowTarget>pumpOnValue)) fuelFlow=true;
+   if ((!pumpPrime)&&(pumpOnValue>outMin)&&(fuelFlowTarget>=pumpOnValue)) fuelFlow=true;//>= keeps the solenoid on at exactly pumpOnValue (no dead-zone fuel cut)
   else if ((!pumpPrime)&&(pumpOnValue==outMin)&&(fuelFlowTarget>outMin)) fuelFlow=true;
   else if (activeValveActive) fuelFlow=ActiveValveUpdate(activeValveDuty);
    else fuelFlow=false;
@@ -1768,6 +1783,7 @@ void ControlOutput()
    {
    
     fuelFlowNow=fuelFlowTarget;
+    if ((pumpOnValue>outMin)&&(fuelFlowNow<pumpOnValue)) fuelFlowNow=(pumpOnValue-1);//pump min floor also during prime (target may be below it)
     fuelServo.write(map(fuelFlowNow,outMin,outMax,MIN_MICROS,MAX_MICROS));
      digitalWrite(Fuel_Solenoid_Pin,LOW);//Keep Fuel Solenoid off to stop fuel from going to engine
    }
@@ -1783,6 +1799,7 @@ void ControlOutput()
   if ((fuelFlowTarget<fuelFlowNow)&&((millis()-fuelFlowTimeOld)>lowDecelDelay) )//fuel pump control with deceleration delay
   {
     fuelFlowNow--;
+    if ((pumpOnValue>outMin)&&(fuelFlowNow<(pumpOnValue-1))) fuelFlowNow=(pumpOnValue-1);//pump never drops below its minimum (stops the floor waggle in the pulsed regime)
   fuelServo.write(map(fuelFlowNow,outMin,outMax,MIN_MICROS,MAX_MICROS));
   fuelFlowTimeOld=millis();
   }
@@ -1798,6 +1815,7 @@ else if ((ignitionState)&&(RPMAvg>=idleRPM))    //handle fuel flow above Idle RP
   if ((fuelFlowTarget<fuelFlowNow)&&((millis()-fuelFlowTimeOld)>decelerationDelay) )//fuel pump control with deceleration delay
   {
     fuelFlowNow--;
+    if ((pumpOnValue>outMin)&&(fuelFlowNow<(pumpOnValue-1))) fuelFlowNow=(pumpOnValue-1);//pump never drops below its minimum (stops the floor waggle in the pulsed regime)
     fuelServo.write(map(fuelFlowNow,outMin,outMax,MIN_MICROS,MAX_MICROS));//Servo command takes a value of 0-180
   fuelFlowTimeOld=millis();
   }
@@ -2683,9 +2701,14 @@ Data+=measuredLoopTime;
 Data+=",";
 Data+=fsWriteTime;
 Data+=",";
-Data+=sysMsg;
-Data+='\n';
-sysMsg="";//Clear sysMsg so it does not repeat without a trigger
+if (sysMsgPending)//system Message queued by core 1 (AbortAll), formatted here on core 0 only
+{
+  Data+="Error Code, ";
+  Data+=sysMsgErrCode;
+  Data+='\n';
+  sysMsgPending=false;
+}
+else Data+='\n';
 if((fsavailable)) 
 { 
   if (Data.length()>1024)
@@ -2835,7 +2858,7 @@ if ((millis()-engineUsageTimeOld)>saveUsageTime)
   } while(file);
     saveSettings();
     file = LittleFS.open(filename,FILE_APPEND);
-    SaveDataHeader();
+    headerPending=true;//SaveDataHeader runs on core 0 (Task1code) to avoid a cross-core String race
   if (file){ 
    fsavailable=true;
    Serial.print("File opened ");
