@@ -423,7 +423,7 @@ bool fuelFlow=false;//Solenoid Fuel Valve
 int glowPower=outMin; //output signal for glow plug  
 
 //Active Valve control (v11_ActiveValve variant)
-#define activeValvePeriod 1000      //solenoid pulse period in ms (max frequency is 1 Hz)
+#define activeValvePeriod 500       //solenoid pulse period in ms (fixed 2 Hz; minimum pulse frequency is 1 Hz)
 bool  activeValveActive=false;      //true when pulsed solenoid control is in use (flow below pump minimum)
 float activeValveDuty=0.0;          //solenoid on-time duty cycle 0..1 for the current period
 bool  activeValveOn=false;          //current solenoid state within the pulse period
@@ -1687,9 +1687,9 @@ void AbortAll()
 }
 
 //Active Valve solenoid pulse: returns the fuel solenoid command for the current
-//1 Hz period. The solenoid is held on for (duty*period) ms and off for the rest,
-//so the average fuel flow is duty x (minimum pump flow). Frequency is capped at
-//1 Hz (period >= 1000 ms) to limit valve wear.
+//2 Hz period. The solenoid is held on for (duty*period) ms and off for the rest,
+//so the average fuel flow is duty x (minimum pump flow). The pulse frequency is
+//fixed at 2 Hz; 1 Hz is the minimum allowed frequency (period never exceeds 1000 ms).
 bool ActiveValveUpdate(float duty)
 {
   unsigned long now=millis();
@@ -1739,7 +1739,7 @@ void ControlOutput()
   
    //Active Valve: when the commanded fuel flow is below the pump minimum setpoint
    //(pumpOnValue) the pump cannot run any slower, so hold the pump at its minimum
-   //and pulse the fuel solenoid at up to 1 Hz to deliver a lower average flow.
+   //and pulse the fuel solenoid at 2 Hz to deliver a lower average flow.
    if ((!pumpPrime)&&(pumpOnValue>outMin)&&(valveDesiredFlow<pumpOnValue))
    {
      if (valveDesiredFlow>outMin)
