@@ -119,6 +119,11 @@ span{
     <input type="number" name="glowOffRPM" min="0">
     <input type="submit" value="Submit">
   </form><br>
+   <p>Glow Power: <span id='idglowPower'></span> (0-1000, 1000 = full)</p>
+  <form action="/get">
+    <input type="number" name="glowPower" min="0" max="1000">
+    <input type="submit" value="Submit">
+  </form><br>
    <p>Ignition RPM High: <span id='idignitionRPMHigh'></span></p>
   <form action="/get">
   <input type="number" name="ignitionRPMHigh" min="0">
@@ -222,6 +227,7 @@ setInterval(function ( ) {
             document.getElementById("idrpmTolerance").innerText = data.rpmTolerance;
             document.getElementById("idglowOnRPM").innerText = data.glowOnRPM;
             document.getElementById("idglowOffRPM").innerText = data.glowOffRPM;
+            document.getElementById("idglowPower").innerText = data.glowPower;
             document.getElementById("idignitionRPMHigh").innerText = data.ignitionRPMHigh;
             document.getElementById("idignitionRPMLow").innerText = data.ignitionRPMLow;
             document.getElementById("idgasOnRPM").innerText = data.gasOnRPM;
@@ -241,6 +247,7 @@ setInterval(function ( ) {
             document.getElementById("idrpmTolerance").innerText = "?";
             document.getElementById("idglowOnRPM").innerText = "?";
             document.getElementById("idglowOffRPM").innerText = "?";
+            document.getElementById("idglowPower").innerText = "?";
             document.getElementById("idignitionRPMHigh").innerText = "?";
             document.getElementById("idignitionRPMLow").innerText = "?";
             document.getElementById("idgasOnRPM").innerText = "?";
@@ -261,6 +268,7 @@ setInterval(function ( ) {
             document.getElementById("idrpmTolerance").innerText = "?";
             document.getElementById("idglowOnRPM").innerText = "?";
             document.getElementById("idglowOffRPM").innerText = "?";
+            document.getElementById("idglowPower").innerText = "?";
             document.getElementById("idignitionRPMHigh").innerText = "?";
             document.getElementById("idignitionRPMLow").innerText = "?";
             document.getElementById("idgasOnRPM").innerText = "?";

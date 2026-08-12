@@ -175,6 +175,7 @@ char* PARAM_idleRPM = "idleRPM";                           //RPM while running a
 char* PARAM_rpmTolerance = "rpmTolerance";                      //RPM tolerance range, target RPMs will be RPM+ within rpmTolerance range
 char* PARAM_glowOnRPM = "glowOnRPM";                       //RPM at which glow plug will be switched on at startup
 char* PARAM_glowOffRPM = "glowOffRPM";                     //RPM exceeding which the glow plug will be turned off
+char* PARAM_glowPower = "glowPower";                       //Glow plug PWM power level 0-1000 (1000 = full power)
 char* PARAM_ignitionRPMHigh = "ignitionRPMHigh";           //At start up ECU will run engine between ignitionRPMHIGH and ignitionRPMLOW with gas and glow plug energized to create ignition
 char* PARAM_ignitionRPMLow = "ignitionRPMLow";             //At start up ECU will run engine between ignitionRPMHIGH and ignitionRPMLOW with gas and glow plug energized to create ignition
 char* PARAM_gasOnRPM= "gasOnRPM";                          //RPM at which gas valve will be turned On
@@ -214,6 +215,7 @@ String inputidleRPM;
 String inputrpmTolerance;
 String inputglowOnRPM ;
 String inputglowOffRPM;
+String inputglowPower;
 String inputignitionRPMHigh ;
 String inputignitionRPMLow ;
 String inputgasOnRPM;
@@ -422,6 +424,7 @@ int idleFuelFlow=outMin; //pump throttle at idle RPM
 bool gasFlow=false; //Solenoid gas valve for starting
 bool fuelFlow=false;//Solenoid Fuel Valve
 int glowPower=outMin; //output signal for glow plug  
+int glowPowerLevel=1000; //Glow plug PWM power 0-1000 (1000 = full power), user selectable  
 
 //Active Valve control (v11_ActiveValve variant)
 #define activeValvePeriod 1000      //solenoid pulse period in ms (max frequency is 1 Hz; the solenoid never switches more than once per second)
@@ -595,8 +598,8 @@ myMAX31855.begin();
   
   fuelServo.write(0);
   startServo.write(0);
-  pinMode(GlowPin,OUTPUT);//glow plug driven as plain GPIO relay (no servo output)
-  digitalWrite(GlowPin,LOW);
+  pinMode(GlowPin,OUTPUT);//glow plug driven as PWM output (power level selectable)
+  analogWrite(GlowPin,0);
   delay(3000);//let the servo signals stabilize
   
   ReadSettings();//read constants from EEPROM if available
@@ -764,9 +767,23 @@ void ProcessSerialLine(String cmdLine)
   {
     Serial.println("CMD:PING OK");
   }
+  else if (cmd=="GLOW")
+  {
+    if (!serialArgIsNumber(arg)) Serial.println("CMD:GLOW ERR");
+    else
+    {
+      int n=arg.toInt();
+      if ((n<outMin)||(n>outMax)) Serial.println("CMD:GLOW ERR");
+      else
+      {
+        glowPowerLevel=n;
+        Serial.println(String("CMD:GLOW ")+String(n)+" OK");
+      }
+    }
+  }
   else if (cmd=="HELP")
   {
-    Serial.println("CMD:START|STOP|THROTTLE n|MODE n|SETRPM n|SETTEMP n|ABORT|RESET|RC|PING|HELP");
+    Serial.println("CMD:START|STOP|THROTTLE n|MODE n|SETRPM n|SETTEMP n|GLOW n|ABORT|RESET|RC|PING|HELP");
   }
   else Serial.println("CMD:UNKNOWN "+cmdLine);
 }
@@ -838,6 +855,8 @@ void SendSerialTelemetry()
   Serial.print(startMotorNow);
   Serial.print(",\"glow\":");
   Serial.print(glowPower);
+  Serial.print(",\"glowlvl\":");
+  Serial.print(glowPowerLevel);
   Serial.print(",\"gas\":");
   Serial.print(gasFlow?1:0);
   Serial.print(",\"fuelv\":");
@@ -981,7 +1000,7 @@ void UpdateDisplay()
   else if (bitRead(errorCode,7)) strcpy(line1,"No Idle RPM");
   else                           strcpy(line1,"Error");
 
-  snprintf(line2,17,"%d RPM %d%%",RPMAvg,thr);
+  snprintf(line2,17,"%dR %d%% %dC",RPMAvg,thr,(int)exTemp);
 
   if (strcmp(line1,lcdLine1)!=0)
   {
@@ -1146,6 +1165,7 @@ void ReadTempSensors()
    rpmTolerance=preferences.getInt("rpmTolerance",rpmTolerance);
    glowOnRPM=preferences.getInt("glowOnRPM",glowOnRPM);
    glowOffRPM=preferences.getInt("glowOffRPM",glowOffRPM);
+   glowPowerLevel=preferences.getInt("glowPower",glowPowerLevel);
   ignitionRPMHigh=preferences.getInt("ignitionRPMHigh",ignitionRPMHigh);
     ignitionRPMLow=preferences.getInt("ignitionRPMLow",ignitionRPMLow);
       gasOnRPM=preferences.getInt("gasOnRPM",gasOnRPM);
@@ -1399,8 +1419,8 @@ void StartingFunction()
     }
     else    // if (startStage==startStage1)  //ignition cycle
     {
-     //glow plug operation
-    if ((RPMAvg>=glowOnRPM)&&(RPMAvg<glowOffRPM))glowPower=outMax;
+     //glow plug operation: on only until ignition is achieved (temp >= ignitionThreshold)
+    if ((RPMAvg>=glowOnRPM)&&(RPMAvg<glowOffRPM)&&(!ignitionState))glowPower=outMax;
     else  glowPower=outMin;
 
     //gas flow operation
@@ -1686,7 +1706,7 @@ void AbortAll()
   
   fuelServo.write(MIN_MICROS);
   startServo.write(MIN_MICROS);
-  digitalWrite(GlowPin,LOW);//glow plug relay off
+  analogWrite(GlowPin,0);//glow plug PWM off
   digitalWrite(GasPin,LOW);
   digitalWrite(Fuel_Solenoid_Pin,LOW);
   gasOnTime=0;
@@ -1837,7 +1857,8 @@ if(startMotorTarget>starterTransition)
   startMotorTimeOld=millis();
   }
 
-  digitalWrite(GlowPin,(glowPower>outMin)?HIGH:LOW);//glow plug relay: on whenever glowPower is above minimum 
+  if (glowPower>outMin) analogWrite(GlowPin,map(glowPowerLevel,outMin,outMax,0,255));//PWM duty from selectable glow power level
+  else analogWrite(GlowPin,0); 
  if(gasFlow) digitalWrite(GasPin,HIGH);
  else digitalWrite(GasPin,LOW);
  if(fuelFlow) digitalWrite(Fuel_Solenoid_Pin,HIGH);
@@ -1901,6 +1922,7 @@ String getSensorReadings(){
   readings["fuel"]=String(fuelFlowNow);//use String(fuelFlowNow/1.0);  to show in fractions
   readings["starter"]=String(startMotorNow);
   readings["glow"]=String(glowPower);
+  readings["glowpwr"]=String(glowPowerLevel);
   readings["batvolt"]=String(voltage);
   char tempbuffer[16];
   char tempbuffer2[16];
@@ -2165,6 +2187,7 @@ doc["maxRPM"] = String(maxRPM);
  doc["rpmTolerance"]=String(rpmTolerance);
  doc["glowOnRPM"] = String(glowOnRPM);
  doc["glowOffRPM"] = String(glowOffRPM);
+ doc["glowPower"] = String(glowPowerLevel);
  doc["ignitionRPMHigh"]=String(ignitionRPMHigh);
  doc["ignitionRPMLow"]=String(ignitionRPMLow);
  doc["gasOnRPM"]=String(gasOnRPM);
@@ -2310,13 +2333,23 @@ server.on("/get", HTTP_GET, [] (AsyncWebServerRequest *request) {
      preferences.putInt("glowOnRPM",glowOnRPM);
      preferences.end();
     }}
-     if (request->hasParam(PARAM_glowOffRPM)) {
+      if (request->hasParam(PARAM_glowOffRPM)) {
       inputglowOffRPM = request->getParam(PARAM_glowOffRPM)->value();
       if (inputglowOffRPM.length()>0){
           glowOffRPM=inputglowOffRPM.toInt();
           Serial.println("glow Off RPM Updated to "+inputglowOffRPM);
-     preferences.begin("settings",false);
+      }
      preferences.putInt("glowOffRPM",glowOffRPM);
+
+      if (request->hasParam(PARAM_glowPower)) {
+      inputglowPower = request->getParam(PARAM_glowPower)->value();
+      if (inputglowPower.length()>0){
+          glowPowerLevel=inputglowPower.toInt();
+          if (glowPowerLevel<outMin) glowPowerLevel=outMin;
+          if (glowPowerLevel>outMax) glowPowerLevel=outMax;
+          Serial.println("Glow Power Level Updated to "+inputglowPower);
+      }
+     preferences.putInt("glowPower",glowPowerLevel);
      preferences.end();
     }}
     if (request->hasParam(PARAM_ignitionRPMHigh)) {
