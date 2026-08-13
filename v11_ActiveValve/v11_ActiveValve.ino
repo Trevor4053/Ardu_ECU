@@ -663,6 +663,19 @@ bool serialArgIsNumber(String arg)
   return true;
 }
 
+//Validate that arg is a non-negative number string (digits with at most one '.').
+bool serialArgIsFloat(String arg)
+{
+  if (arg.length()==0) return false;
+  int dots=0;
+  for (unsigned int i=0;i<arg.length();i++)
+  {
+    if (arg[i]=='.') dots++;
+    else if ((arg[i]<'0')||(arg[i]>'9')) return false;
+  }
+  return dots<=1;
+}
+
 //Parse and execute one complete serial command line.
 void ProcessSerialLine(String cmdLine)
 {
@@ -781,11 +794,179 @@ void ProcessSerialLine(String cmdLine)
       }
     }
   }
+  else if (cmd=="SET")
+  {
+    //SET <name> <value>  - persist a web-settable parameter to NVS (same keys as /get)
+    int sp2=arg.indexOf(' ');
+    if (sp2<=0) Serial.println("CMD:SET ERR");
+    else
+    {
+      String pname=arg.substring(0,sp2);
+      String pval=arg.substring(sp2+1);
+      if (SerialSetParam(pname,pval))
+        Serial.println(String("CMD:SET ")+pname+" "+pval+" OK");
+      else
+        Serial.println(String("CMD:SET ")+pname+" ERR");
+    }
+  }
+  else if (cmd=="PARAMS")
+  {
+    //PARAMS - dump all web-settable parameters as one compact JSON line
+    SendParamsJSON();
+  }
   else if (cmd=="HELP")
   {
-    Serial.println("CMD:START|STOP|THROTTLE n|MODE n|SETRPM n|SETTEMP n|GLOW n|ABORT|RESET|RC|PING|HELP");
+    Serial.println("CMD:START|STOP|THROTTLE n|MODE n|SETRPM n|SETTEMP n|GLOW n|SET <name> <value>|PARAMS|ABORT|RESET|RC|PING|HELP");
   }
   else Serial.println("CMD:UNKNOWN "+cmdLine);
+}
+
+//Set a web-settable parameter from the serial SET command. Names match the
+//webpage parameter names (page1.h/page2.h). Values are clamped to the web form
+//limits and persisted to NVS with the same keys as the /get web handler.
+bool SerialSetParam(String name, String value)
+{
+  name.toLowerCase();
+  value.trim();
+  preferences.begin("settings",false);
+  bool ok=true;
+  int n=value.toInt();
+  float f=value.toFloat();
+  if (name=="maxtemp")     { if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<100)n=100; if(n>1400)n=1400; maxTemp=n; preferences.putInt("maxTemp",maxTemp);} }
+  else if (name=="maxtempgrad") { if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; if(n>600)n=600; maxTempGrad=n; preferences.putInt("maxTempGrad",maxTempGrad);} }
+  else if (name=="maxrpm")  { if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; maxRPM=n; preferences.putInt("maxRPM",maxRPM);} }
+  else if (name=="idlerpm") { if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; idleRPM=n; preferences.putInt("idleRPM",idleRPM);} }
+  else if (name=="rpmtolerance") { if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; rpmTolerance=n; preferences.putInt("rpmTolerance",rpmTolerance);} }
+  else if (name=="glowonrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; glowOnRPM=n; preferences.putInt("glowOnRPM",glowOnRPM);} }
+  else if (name=="glowoffrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; glowOffRPM=n; preferences.putInt("glowOffRPM",glowOffRPM);} }
+  else if (name=="glowpower"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<outMin)n=outMin; if(n>outMax)n=outMax; glowPowerLevel=n; preferences.putInt("glowPower",glowPowerLevel);} }
+  else if (name=="ignitionrpmhigh"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; ignitionRPMHigh=n; preferences.putInt("ignitionRPMHigh",ignitionRPMHigh);} }
+  else if (name=="ignitionrpmlow"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; ignitionRPMLow=n; preferences.putInt("ignitionRPMLow",ignitionRPMLow);} }
+  else if (name=="gasonrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; gasOnRPM=n; preferences.putInt("gasOnRPM",gasOnRPM);} }
+  else if (name=="gasoffrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; gasOffRPM=n; preferences.putInt("gasOffRPM",gasOffRPM);} }
+  else if (name=="starteroffrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; starterOffRPM=n; preferences.putInt("starterOffRPM",starterOffRPM);} }
+  else if (name=="fuelonrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; fuelOnRPM=n; preferences.putInt("fuelOnRPM",fuelOnRPM);} }
+  else if (name=="pumponvalue"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; if(n>outMax)n=outMax; pumpOnValue=n; preferences.putInt("pumpOnValue",pumpOnValue);} }
+  else if (name=="purgetime"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; purgeTime=n; preferences.putInt("purgeTime",purgeTime);} }
+  else if (name=="purgethrottle"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; if(n>500)n=500; purgeThrottle=n; preferences.putInt("purgeThrottle",purgeThrottle);} }
+  else if (name=="starterincdelay"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; starterIncDelay=n; preferences.putInt("starterIDelay",starterIncDelay);} }
+  else if (name=="starterlimit"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; starterLimit=n; preferences.putInt("starterLimit",starterLimit);} }
+  else if (name=="accelerationdelay"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; accelerationDelay=n; preferences.putInt("accelDelay",accelerationDelay);} }
+  else if (name=="decelerationdelay"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; decelerationDelay=n; preferences.putInt("decelDelay",decelerationDelay);} }
+  else if (name=="lowacceldelay"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; lowAccelDelay=n; preferences.putInt("lowADelay",lowAccelDelay);} }
+  else if (name=="lowdeceldelay"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; lowDecelDelay=n; preferences.putInt("lowDDelay",lowDecelDelay);} }
+  else if (name=="ignitionthreshold"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; ignitionThreshold=n; preferences.putInt("ignThreshold",ignitionThreshold);} }
+  else if (name=="noignitionthreshold"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; noIgnitionThreshold=n; preferences.putInt("noIgnThreshold",noIgnitionThreshold);} }
+  else if (name=="fuelflowdetectiontime"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; fuelFlowDetectionTime=n; preferences.putInt("fuelDetTime",fuelFlowDetectionTime);} }
+  else if (name=="fuelflowdetectionrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; fuelFlowDetectionRPM=n; preferences.putInt("fuelDetRPM",fuelFlowDetectionRPM);} }
+  else if (name=="trialmodefuelonrpm"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; trialModeFuelOnRPM=n; preferences.putInt("trModeFuelOnRPM",trialModeFuelOnRPM);} }
+  else if (name=="trialmodefuelflow"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; if(n>500)n=500; trialModeFuelFlow=n; preferences.putInt("trModeFuelFlow",trialModeFuelFlow);} }
+  else if (name=="startingtemp"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<0)n=0; startingTemp=n; preferences.putInt("startingTemp",startingTemp);} }
+  else if (name=="maxmotorvolt"){ if (!serialArgIsFloat(value)) ok=false; else { f=value.toFloat(); if(f<0)f=0; maxMotorVolt=f; preferences.putFloat("maxMotorVolt",maxMotorVolt);} }
+  else if (name=="maxpumpvolt"){ if (!serialArgIsFloat(value)) ok=false; else { f=value.toFloat(); if(f<0)f=0; maxPumpVolt=f; preferences.putFloat("maxPumpVolt",maxPumpVolt);} }
+  else if (name=="min_micros"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n<500)n=500; MIN_MICROS=n; preferences.putInt("MIN_MICROS",MIN_MICROS);} }
+  else if (name=="max_micros"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if(n>2500)n=2500; MAX_MICROS=n; preferences.putInt("MAX_MICROS",MAX_MICROS);} }
+  else if (name=="voltin"){ if (!serialArgIsFloat(value)) ok=false; else { f=value.toFloat(); if(f>0) { float volt=resistorRatio*3.3*(float(voltsensorValue)/4095); if(volt>0) { voltCorrection=f/volt; preferences.putFloat("voltCorr",voltCorrection); } else ok=false; } else ok=false; } }
+  else if (name=="cpr"){ if (!serialArgIsNumber(value)) ok=false; else { n=value.toInt(); if((n!=1)&&(n!=2)) ok=false; else { cpr=n; preferences.putInt("cpr",cpr);} } }
+  else if (name=="wifissid"){ if (value.length()==0) ok=false; else { ssid=value; preferences.putString("SSID",ssid);} }
+  else if (name=="wifipwd"){ if (value.length()<=7) ok=false; else { password=value; preferences.putString("PWD",password);} }
+  else ok=false;
+  preferences.end();
+  return ok;
+}
+
+//Dump all web-settable parameters as one compact JSON line prefixed with "PARAMS:".
+//The GUI Setup page uses this to populate its value fields.
+void SendParamsJSON()
+{
+  Serial.print("PARAMS:{\"maxTemp\":");
+  Serial.print(maxTemp);
+  Serial.print(",\"maxTempGrad\":");
+  Serial.print(maxTempGrad);
+  Serial.print(",\"maxRPM\":");
+  Serial.print(maxRPM);
+  Serial.print(",\"idleRPM\":");
+  Serial.print(idleRPM);
+  Serial.print(",\"rpmTolerance\":");
+  Serial.print(rpmTolerance);
+  Serial.print(",\"glowOnRPM\":");
+  Serial.print(glowOnRPM);
+  Serial.print(",\"glowOffRPM\":");
+  Serial.print(glowOffRPM);
+  Serial.print(",\"glowPower\":");
+  Serial.print(glowPowerLevel);
+  Serial.print(",\"ignitionRPMHigh\":");
+  Serial.print(ignitionRPMHigh);
+  Serial.print(",\"ignitionRPMLow\":");
+  Serial.print(ignitionRPMLow);
+  Serial.print(",\"gasOnRPM\":");
+  Serial.print(gasOnRPM);
+  Serial.print(",\"gasOffRPM\":");
+  Serial.print(gasOffRPM);
+  Serial.print(",\"starterOffRPM\":");
+  Serial.print(starterOffRPM);
+  Serial.print(",\"fuelOnRPM\":");
+  Serial.print(fuelOnRPM);
+  Serial.print(",\"startingTemp\":");
+  Serial.print(startingTemp);
+  Serial.print(",\"pumpOnValue\":");
+  Serial.print(pumpOnValue);
+  Serial.print(",\"voltIn\":");
+  {
+    float voltOut=voltage;
+    if ((isnan(voltOut))||(voltOut<0)) voltOut=0;
+    if (voltOut>100) voltOut=100;
+    Serial.print(voltOut,1);
+  }
+  Serial.print(",\"purgeTime\":");
+  Serial.print(purgeTime);
+  Serial.print(",\"purgeThrottle\":");
+  Serial.print(purgeThrottle);
+  Serial.print(",\"starterIncDelay\":");
+  Serial.print(starterIncDelay);
+  Serial.print(",\"starterLimit\":");
+  Serial.print(starterLimit);
+  Serial.print(",\"accelerationDelay\":");
+  Serial.print(accelerationDelay);
+  Serial.print(",\"decelerationDelay\":");
+  Serial.print(decelerationDelay);
+  Serial.print(",\"lowAccelDelay\":");
+  Serial.print(lowAccelDelay);
+  Serial.print(",\"lowDecelDelay\":");
+  Serial.print(lowDecelDelay);
+  Serial.print(",\"ignitionThreshold\":");
+  Serial.print(ignitionThreshold);
+  Serial.print(",\"noIgnitionThreshold\":");
+  Serial.print(noIgnitionThreshold);
+  Serial.print(",\"trialModeFuelOnRPM\":");
+  Serial.print(trialModeFuelOnRPM);
+  Serial.print(",\"trialModeFuelFlow\":");
+  Serial.print(trialModeFuelFlow);
+  Serial.print(",\"fuelFlowDetectionTime\":");
+  Serial.print(fuelFlowDetectionTime);
+  Serial.print(",\"fuelFlowDetectionRPM\":");
+  Serial.print(fuelFlowDetectionRPM);
+  Serial.print(",\"cpr\":");
+  Serial.print(cpr);
+  Serial.print(",\"MIN_MICROS\":");
+  Serial.print(MIN_MICROS);
+  Serial.print(",\"MAX_MICROS\":");
+  Serial.print(MAX_MICROS);
+  Serial.print(",\"maxMotorVolt\":");
+  Serial.print(maxMotorVolt);
+  Serial.print(",\"maxPumpVolt\":");
+  Serial.print(maxPumpVolt);
+  Serial.print(",\"WiFiSSID\":\"");
+  {
+    String e=ssid; e.replace("\\","\\\\"); e.replace("\"","\\\"");
+    Serial.print(e);
+  }
+  Serial.print("\",\"WiFiPWD\":\"");
+  {
+    String e=password; e.replace("\\","\\\\"); e.replace("\"","\\\"");
+    Serial.print(e);
+  }
+  Serial.println("\"}");
 }
 
 //Apply serial GUI override of RC inputs and simulated sensors when active
