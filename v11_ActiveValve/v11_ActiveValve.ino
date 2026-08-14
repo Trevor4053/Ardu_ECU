@@ -87,6 +87,7 @@ Note: All settings in this sequence are changeable through web interface
 #include "page6.h"//Readings at abort time screen
 #include "page7.h"//Engine and ECU Lifetime usage
 #include "page8.h"//Data file download page
+#include "page9.h"//Start & Throttle control page
 
 
 //for storing data to Internal Flash
@@ -477,6 +478,15 @@ String serialCmdBuf="";            //incoming serial line accumulator (non-block
 unsigned long serialCmdLastMillis=0;//time of last received serial line (watchdog)
 unsigned long serialCmdTimeout=5000; //ms without serial traffic before reverting to physical control
 unsigned long errorResetTime=0;    //timestamp for non-blocking error auto-reset in WaitingFunction
+
+// --- Web start/throttle control (page9) --- //
+bool webCmdActive=false;           //true when web page9 override of RC inputs is active
+int  webCmdThrottle=0;             //web throttle override 0-100
+bool webCmdThrottleValid=false;    //set true by /throttle and /start
+int  webCmdMode=100;               //web mode override 0-100
+bool webCmdModeValid=false;        //set true by /start and /stop
+unsigned long webCmdLastMillis=0;  //time of last web control traffic (watchdog)
+unsigned long webCmdTimeout=10000; //ms without page9 traffic before reverting to physical control
 
 // --- Helper Functions required for LittleFS Replacement --- //
 bool fsAvailableFlag=false;   //set true once LittleFS is mounted (set in initLittleFS)
@@ -994,6 +1004,26 @@ void ApplySerialOverride()
   if (serialCmdTempValid) exTemp=serialCmdTemp;
 }
 
+//Apply web page9 override of RC inputs when active (serial GUI takes precedence)
+void ApplyWebOverride()
+{
+  if (webCmdActive)
+  {
+    //Watchdog: page9 polls /webkeepalive, so if no traffic arrives
+    //for webCmdTimeout ms the web page is assumed closed - revert to physical control.
+    if ((millis()-webCmdLastMillis)>webCmdTimeout)
+    {
+      webCmdActive=false;
+      webCmdThrottleValid=false;
+      webCmdModeValid=false;
+    }
+  }
+  if ((!webCmdActive)||(serialCmdActive)) return;
+  switchControlActive=true;//suppress RC-signal-lost fault while web override is active
+  if (webCmdThrottleValid) rcThrottleSignal=webCmdThrottle;
+  if (webCmdModeValid) rcModeSignal=webCmdMode;
+}
+
 //One line of compact JSON telemetry, sent once per second
 void SendSerialTelemetry()
 {
@@ -1072,6 +1102,7 @@ void loop(void) {
   ReadTempSensors(); //100ms loop time
   ReadVoltage();
   ApplySerialOverride();//serial GUI override of RC inputs and simulated sensors (if active)
+  ApplyWebOverride();//web page9 override of RC inputs (if active)
   UpdateDisplay(); //LCD refresh once per second
   ProcessSerialCommands();//parse GUI commands from serial
   SendSerialTelemetry();//one line of JSON telemetry per second
@@ -2190,7 +2221,57 @@ void WebServerFunction()
 //display dir and download page
  server.on("/page8", HTTP_GET, [](AsyncWebServerRequest *request){
  
- request->send_P(200, "text/html",htmlPage8, page8processor);
+request->send_P(200, "text/html",htmlPage8, page8processor);
+ });
+//display engine start and throttle control page
+ server.on("/page9", HTTP_GET, [](AsyncWebServerRequest *request){
+ request->send_P(200, "text/html",htmlPage9);
+ });
+//web start command: mode signal high, throttle to zero (same as serial START)
+ server.on("/start", HTTP_GET, [](AsyncWebServerRequest *request){
+  webCmdActive=true;
+  webCmdThrottle=0; webCmdThrottleValid=true;
+  webCmdMode=100;   webCmdModeValid=true;
+  webCmdLastMillis=millis();
+  Serial.println("Web START");
+  request->redirect("/page9");
+});
+ server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
+  webCmdActive=true;
+  webCmdMode=0; webCmdModeValid=true;
+  webCmdLastMillis=millis();
+  Serial.println("Web STOP");
+  request->redirect("/page9");
+});
+//web throttle command: /throttle?t=<0-100>
+ server.on("/throttle", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (request->hasParam("t"))
+  {
+    int t=request->getParam("t")->value().toInt();
+    if (t<0) t=0;
+    if (t>100) t=100;
+    webCmdActive=true;
+    webCmdThrottle=t; webCmdThrottleValid=true;
+    webCmdLastMillis=millis();
+    Serial.println(String("Web THROTTLE ")+String(t));
+  }
+  request->redirect("/page9");
+});
+//web abort: shut everything down immediately
+ server.on("/abortweb", HTTP_GET, [](AsyncWebServerRequest *request){
+  AbortAll();
+  webCmdLastMillis=millis();
+  Serial.println("Web ABORT");
+  request->redirect("/page9");
+});
+//release web control, return to RC/switch control
+ server.on("/webRC", HTTP_GET, [](AsyncWebServerRequest *request){
+  webCmdActive=false;
+  webCmdThrottleValid=false;
+  webCmdModeValid=false;
+  webCmdLastMillis=millis();
+  Serial.println("Web RC (control released)");
+  request->redirect("/page9");
 });
 //display data terminal with realtime values
  server.on("/ModeNormal", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -2421,6 +2502,10 @@ DynamicJsonDocument docpage2(8192);
   // Request for the latest sensor readings
   server.on("/keepalive", HTTP_GET, [](AsyncWebServerRequest *request){
     keepalivecounter=millis();//update keep alive counter to keep transmitting event messages
+    });
+  // Keep web page9 override watchdog alive (only page9 polls this)
+  server.on("/webkeepalive", HTTP_GET, [](AsyncWebServerRequest *request){
+    webCmdLastMillis=millis();
     });
       // Send a GET request to <ESP_IP>/update?state=<inputMessage>
   server.on("/update", HTTP_GET, [] (AsyncWebServerRequest *request) {

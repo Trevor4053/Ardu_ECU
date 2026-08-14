@@ -88,6 +88,7 @@ span{
             <a  href="/page6" class="button">Page6</a>
             <a  href="/page7" class="button">Page7</a>
             <a  href="/page8" class="button">Page8</a>
+            <a  href="/page9" class="button">Page9</a>
         </p>
 
     
